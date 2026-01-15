@@ -4,14 +4,20 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QInputDialog,
     QLineEdit,
+    QStyle # <--- Necesario para iconos de sistema
 )
+from PyQt6.QtGui import QIcon, QColor # <--- Necesario para pintar la lista
 from app.views.main_view import MainView
 from app.views.login_view import LoginView
 from app.views.selector_view import SelectorView
 from app.models.user_model import UserModel
 from app.utils.pdf_stamper import PDFStamper
 import os
+import shutil
+from app.utils.paths import get_app_data_path
 
+# Import del Worker
+from app.workers.signing_worker import SigningWorker
 
 class MainController:
     def __init__(self):
@@ -19,6 +25,7 @@ class MainController:
         self.login_view = None
         self.main_view = None
         self.current_user = None
+        self.worker = None # Referencia para el hilo
 
         # Estado de la aplicación
         self.is_dark_mode = True
@@ -147,16 +154,38 @@ class MainController:
 
     def upload_signature(self):
         file, _ = QFileDialog.getOpenFileName(
-            self.main_view, "Seleccionar Firma", "", "Images (*.png *.jpg *.jpeg)"
+            self.main_view, 
+            "Seleccionar Firma", 
+            "", 
+            "Images (*.png *.jpg *.jpeg)"
         )
+        
         if file:
-            self.user_model.update_signature(self.current_user["id"], file)
-            self.current_user["signature_path"] = file
-            self.main_view.user_data["signature_path"] = file
-            self.main_view.set_signature_image(file)
-            QMessageBox.information(
-                self.main_view, "Éxito", "Firma cargada correctamente"
-            )
+            # 1. Usar AppData local
+            app_data = get_app_data_path()
+            sig_folder = os.path.join(app_data, "signatures")
+            
+            if not os.path.exists(sig_folder):
+                os.makedirs(sig_folder)
+            
+            # 2. Copiar archivo
+            file_ext = os.path.splitext(file)[1]
+            new_filename = f"sig_user_{self.current_user['id']}{file_ext}"
+            destination = os.path.join(sig_folder, new_filename)
+            
+            try:
+                shutil.copy2(file, destination)
+            except Exception as e:
+                QMessageBox.critical(self.main_view, "Error", f"No se pudo guardar: {e}")
+                return
+
+            # 3. Guardar ruta y actualizar
+            self.user_model.update_signature(self.current_user['id'], destination)
+            self.current_user['signature_path'] = destination
+            self.main_view.user_data['signature_path'] = destination
+            self.main_view.set_signature_image(destination)
+            
+            QMessageBox.information(self.main_view, "Éxito", "Firma guardada correctamente.")
 
     def process_signing(self):
         sig_path = self.current_user["signature_path"]
@@ -172,64 +201,84 @@ class MainController:
                 self.main_view, "Atención", "No has seleccionado ningún archivo PDF."
             )
             return
-
-        # Valores por defecto (si no se usa el selector visual)
-        final_x, final_y = 400, 700
-        final_w, final_h = 150, 60
-
-        # Si el usuario definió un área personalizada, sobrescribimos
-        if self.custom_coords:
-            final_x, final_y, final_w, final_h = self.custom_coords
-
-        success_count = 0
-        errors = []
-        final_dest = (
-            self.output_directory
-            if self.output_directory
-            else "Carpeta de origen de cada archivo"
-        )
-
+        
+        # Recopilar lista de archivos (Strings) y resetear estado visual
+        files = []
         for i in range(count):
-            pdf_path = self.main_view.list_files.item(i).text()
-            dir_name, file_name = os.path.split(pdf_path)
+            item = self.main_view.list_files.item(i)
+            # Limpiamos iconos o colores de ejecuciones anteriores
+            item.setIcon(QIcon()) 
+            item.setBackground(QColor(0,0,0,0)) # Transparente
+            item.setToolTip("") 
+            files.append(item.text())
 
-            # Definir ruta de salida
-            if self.output_directory:
-                target_dir = self.output_directory
-            else:
-                target_dir = dir_name
+        # 1. Preparar Interfaz para carga
+        self.main_view.btn_process.setEnabled(False)
+        self.main_view.btn_clear.setEnabled(False)
+        self.main_view.progress_bar.setVisible(True)
+        self.main_view.progress_bar.setValue(0)
+        self.main_view.lbl_process_status.setText("Iniciando motor de firma...")
 
-            output_path = os.path.join(target_dir, f"SIGNED_{file_name}")
+        # 2. Iniciar Worker Thread
+        self.worker = SigningWorker(
+            files=files,
+            sig_path=sig_path,
+            output_dir=self.output_directory,
+            coords=self.custom_coords
+        )
+        
+        # Conectar señales del hilo a la interfaz
+        self.worker.progress_updated.connect(self.update_progress)
+        self.worker.status_updated.connect(self.update_status_label)
+        self.worker.finished_signal.connect(self.on_signing_finished)
+        
+        # --- CONEXIÓN NUEVA: Reporte individual ---
+        self.worker.file_processed.connect(self.on_file_processed)
+        
+        # Arrancar hilo en segundo plano
+        self.worker.start()
 
-            # Pasamos las coordenadas y dimensiones dinámicas
-            ok, msg = PDFStamper.stamp_pdf(
-                pdf_path,
-                sig_path,
-                output_path,
-                x=final_x,
-                y=final_y,
-                width=final_w,
-                height=final_h,
-            )
+    # --- NUEVOS MÉTODOS (SLOTS) PARA MANEJAR EL HILO ---
+    def update_progress(self, val):
+        self.main_view.progress_bar.setValue(val)
 
-            if ok:
-                success_count += 1
-                self.user_model.log_action(
-                    self.current_user["id"], "SIGN_PDF", file_name
-                )
-            else:
-                errors.append(f"{file_name}: {msg}")
+    def update_status_label(self, text):
+        self.main_view.lbl_process_status.setText(text)
+    
+    def on_file_processed(self, index, success, msg):
+        """Se ejecuta cada vez que el worker termina un archivo"""
+        item = self.main_view.list_files.item(index)
+        
+        if success:
+            # Icono Check Verde
+            icon = self.main_view.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+            item.setIcon(icon)
+            item.setToolTip("✅ Firmado correctamente")
+            # Opcional: Color de fondo verde suave
+            # item.setBackground(QColor("#e6fffa"))
+        else:
+            # Icono X Roja (Error crítico)
+            icon = self.main_view.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxCritical)
+            item.setIcon(icon)
+            # Fondo rojo suave para destacar el error
+            bg_color = QColor("#500000") if self.is_dark_mode else QColor("#ffe6e6")
+            item.setBackground(bg_color)
+            # El mensaje de error técnico se guarda en el tooltip
+            item.setToolTip(f"❌ ERROR: {msg}")
 
-        msg = f"Proceso terminado.\n\n"
-        msg += f"📄 Firmados: {success_count}/{count}\n"
-        msg += f"📏 Dimensiones: {int(final_w)}x{int(final_h)}\n"
-        msg += f"📂 Ubicación: {final_dest}\n"
-
-        if errors:
-            msg += "\n⚠️ Errores encontrados:\n" + "\n".join(errors)
-
-        QMessageBox.information(self.main_view, "Reporte de Firma", msg)
-        self.main_view.list_files.clear()
+    def on_signing_finished(self, report_msg):
+        # Restaurar Interfaz
+        self.main_view.btn_process.setEnabled(True)
+        self.main_view.btn_clear.setEnabled(True)
+        self.main_view.lbl_process_status.setText("Proceso finalizado")
+        self.main_view.progress_bar.setVisible(False)
+        
+        # Mostrar resultado
+        QMessageBox.information(self.main_view, "Reporte Final", report_msg)
+        
+        # NOTA IMPORTANTE: Ya no limpiamos la lista automáticamente (list_files.clear)
+        # para que el usuario pueda ver cuáles archivos quedaron en rojo.
+        self.worker = None
 
     # --------------------------------------------------------------------------
     # LÓGICA DE ADMINISTRACIÓN (CRUD)

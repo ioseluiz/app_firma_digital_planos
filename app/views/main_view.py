@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QAbstractItemView,
     QInputDialog,
+    QProgressBar  # Ya lo tenías importado, perfecto.
 )
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtCore import Qt
@@ -28,7 +29,7 @@ class MainView(QMainWindow):
         super().__init__()
         self.user_data = user_data
         self.setWindowTitle(f"DigitalSealer - Usuario: {user_data['username']}")
-        self.resize(1000, 700)  # Un poco más grande para acomodar nuevos controles
+        self.resize(1000, 700)
 
         # Tema Inicial
         self.setStyleSheet(THEMES["dark"])
@@ -109,7 +110,7 @@ class MainView(QMainWindow):
         self.lbl_signature_status = QLabel()
         self.lbl_signature_status.setWordWrap(True)
 
-        # --- SECCION DE COORDENADAS (NUEVO) ---
+        # --- SECCION DE COORDENADAS ---
         lbl_coords = QLabel("2. Posición de la Firma:")
         lbl_coords.setStyleSheet("font-weight: bold; margin-top: 10px;")
 
@@ -122,7 +123,7 @@ class MainView(QMainWindow):
         )
         self.btn_set_coords.setStyleSheet(
             "background-color: #f0ad4e; color: black;"
-        )  # Color distintivo
+        )
 
         # --- SECCION CARPETA SALIDA ---
         lbl_dest = QLabel("3. Carpeta Destino:")
@@ -137,24 +138,42 @@ class MainView(QMainWindow):
         self.btn_select_output = QPushButton("Cambiar Carpeta Destino")
         self.btn_select_output.setStyleSheet("background-color: #5bc0de; color: white;")
 
+        # --- NUEVO BLOQUE: BARRA DE PROGRESO ---
+        # Se agrega aquí para que aparezca antes de los botones de acción
+        self.lbl_process_status = QLabel("Listo")
+        self.lbl_process_status.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.lbl_process_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setVisible(False)  # Oculta inicialmente
+        # ---------------------------------------
+
         # Botones de Acción Principal
         self.btn_process = QPushButton("4. Ejecutar Firmado")
         self.btn_process.setMinimumHeight(50)
         self.btn_clear = QPushButton("Limpiar Lista")
 
+        # Agregando widgets al layout derecho
         right_layout.addWidget(self.lbl_signature_status)
 
-        # Agregamos widgets Coordenadas
         right_layout.addWidget(lbl_coords)
         right_layout.addWidget(self.lbl_coords_status)
         right_layout.addWidget(self.btn_set_coords)
 
-        # Agregamos widgets Carpeta
         right_layout.addWidget(lbl_dest)
         right_layout.addWidget(self.lbl_output_dir)
         right_layout.addWidget(self.btn_select_output)
 
-        right_layout.addStretch()
+        right_layout.addStretch() # Empuja todo lo anterior hacia arriba
+
+        # --- AGREGANDO BARRA DE PROGRESO ---
+        right_layout.addWidget(self.lbl_process_status)
+        right_layout.addWidget(self.progress_bar)
+        right_layout.addSpacing(10)
+        # -----------------------------------
+
         right_layout.addWidget(self.btn_process)
         right_layout.addWidget(self.btn_clear)
 
@@ -295,7 +314,6 @@ class MainView(QMainWindow):
         layout.addLayout(right_panel, 70)
 
     def update_signature_status_label(self):
-        # Este método se usa en la inicialización básica
         if self.user_data.get("signature_path"):
             self.lbl_signature_status.setText(
                 "✅ Firma Digital Cargada\nLista para usar."
@@ -313,7 +331,6 @@ class MainView(QMainWindow):
             )
             self.btn_process.setEnabled(False)
 
-    # Eventos Drag & Drop
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.accept()

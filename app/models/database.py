@@ -1,51 +1,52 @@
 import sqlite3
 import os
-
+from app.utils.paths import get_app_data_path
+import bcrypt 
 
 class Database:
-    def __init__(self, db_name="db/sealer.db"):
-        os.makedirs(os.path.dirname(db_name), exist_ok=True)
-        self.conn = sqlite3.connect(db_name)
-        self.cursor = self.conn.cursor()
-        self.create_tables()
+    def __init__(self):
+        self.db_folder = get_app_data_path()
+        self.db_path = os.path.join(self.db_folder, "sealer.db")
+        self.init_db()
 
-    def create_tables(self):
-        # Tabla de Usuarios
-        self.cursor.execute("""
+    def get_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def init_db(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Tabla Usuarios
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
-                password_hash BLOB NOT NULL,
-                role TEXT NOT NULL, -- 'admin' o 'ingeniero'
+                password_hash BLOB NOT NULL, 
+                role TEXT NOT NULL,
                 signature_path TEXT
             )
-        """)
-
-        # Tabla de Historial
-        self.cursor.execute("""
+        ''')
+        
+        # --- CORRECCIÓN AQUÍ: Cambiamos 'audit_log' por 'history' ---
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 action TEXT,
                 filename TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(id)
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+        ''')
+        
+        # Admin por defecto
+        cursor.execute("SELECT count(*) FROM users")
+        if cursor.fetchone()[0] == 0:
+            password = b"admin123"
+            salt = bcrypt.gensalt()
+            hashed = bcrypt.hashpw(password, salt)
+            cursor.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", 
+                           ("admin", hashed, "admin"))
+            print("Usuario admin creado.")
 
-        # Crear admin por defecto si no existe (pass: admin123)
-        # Nota: En prod esto se hace con un script de seed seguro
-        self.cursor.execute("SELECT count(*) FROM users")
-        if self.cursor.fetchone()[0] == 0:
-            from app.utils.security import hash_password
-
-            pwd = hash_password("admin123")
-            self.cursor.execute(
-                "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-                ("admin", pwd, "admin"),
-            )
-
-        self.conn.commit()
-
-    def get_connection(self):
-        return self.conn
+        conn.commit()
+        conn.close()

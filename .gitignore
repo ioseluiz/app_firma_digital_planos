@@ -3,3 +3,6 @@ venv/
 __pycache__/
 prompt.md
 *.db
+config.ini
+dist/
+build/
