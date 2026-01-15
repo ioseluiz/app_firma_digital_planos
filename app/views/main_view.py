@@ -16,15 +16,18 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QAbstractItemView,
     QInputDialog,
-    QProgressBar  # Ya lo tenías importado, perfecto.
+    QProgressBar
 )
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal  # Importante: pyqtSignal para avisar del drop
 from app.views.styles import THEMES
 import os
 
 
 class MainView(QMainWindow):
+    # Señal para avisar al controlador que se soltaron archivos
+    files_dropped = pyqtSignal(list)
+
     def __init__(self, user_data):
         super().__init__()
         self.user_data = user_data
@@ -32,7 +35,7 @@ class MainView(QMainWindow):
         self.resize(1000, 700)
 
         # Tema Inicial
-        self.setStyleSheet(THEMES["dark"])
+        self.setStyleSheet(THEMES["light"])
 
         # Widget Central
         central_widget = QWidget()
@@ -44,10 +47,26 @@ class MainView(QMainWindow):
         role_text = "Administrador" if user_data["role"] == "admin" else "Ingeniero"
         self.lbl_info = QLabel(f"Rol: {role_text}")
 
-        # Botón cambio de tema
         self.btn_toggle_theme = QPushButton("☀️ / 🌙")
-        self.btn_toggle_theme.setFixedWidth(60)
+        self.btn_toggle_theme.setFixedWidth(100)
         self.btn_toggle_theme.setToolTip("Cambiar Tema")
+
+
+        # Estilo específico para este botón (Gris oscuro, letra grande)
+        # Esto garantiza contraste perfecto en ambos temas.
+        self.btn_toggle_theme.setStyleSheet("""
+            QPushButton {
+                background-color: #444444;
+                color: #ffffff;
+                font-size: 18px;
+                border: 1px solid #666;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #666666;
+            }
+        """)
 
         self.btn_logout = QPushButton("Cerrar Sesión")
         self.btn_logout.setStyleSheet("background-color: #d9534f;")
@@ -91,10 +110,11 @@ class MainView(QMainWindow):
         left_layout = QVBoxLayout()
         lbl_instr = QLabel("1. Arrastra archivos PDF aquí:")
         self.btn_add_files = QPushButton("Seleccionar PDFs")
+        
         self.list_files = QListWidget()
         self.list_files.setAcceptDrops(True)
         self.list_files.setDragDropMode(QListWidget.DragDropMode.DropOnly)
-
+        # Conectamos los eventos de drag & drop propios de la clase
         self.list_files.dragEnterEvent = self.dragEnterEvent
         self.list_files.dragMoveEvent = self.dragMoveEvent
         self.list_files.dropEvent = self.dropEvent
@@ -106,7 +126,6 @@ class MainView(QMainWindow):
         # --- COLUMNA DERECHA: Configuración y Acciones ---
         right_layout = QVBoxLayout()
 
-        # Estado de la firma
         self.lbl_signature_status = QLabel()
         self.lbl_signature_status.setWordWrap(True)
 
@@ -138,8 +157,7 @@ class MainView(QMainWindow):
         self.btn_select_output = QPushButton("Cambiar Carpeta Destino")
         self.btn_select_output.setStyleSheet("background-color: #5bc0de; color: white;")
 
-        # --- NUEVO BLOQUE: BARRA DE PROGRESO ---
-        # Se agrega aquí para que aparezca antes de los botones de acción
+        # --- BARRA DE PROGRESO ---
         self.lbl_process_status = QLabel("Listo")
         self.lbl_process_status.setStyleSheet("color: #aaa; font-size: 11px;")
         self.lbl_process_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -147,33 +165,27 @@ class MainView(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setVisible(False)  # Oculta inicialmente
-        # ---------------------------------------
+        self.progress_bar.setVisible(False)
 
-        # Botones de Acción Principal
+        # Botones de Acción
         self.btn_process = QPushButton("4. Ejecutar Firmado")
         self.btn_process.setMinimumHeight(50)
         self.btn_clear = QPushButton("Limpiar Lista")
 
-        # Agregando widgets al layout derecho
+        # Armado del layout derecho
         right_layout.addWidget(self.lbl_signature_status)
-
         right_layout.addWidget(lbl_coords)
         right_layout.addWidget(self.lbl_coords_status)
         right_layout.addWidget(self.btn_set_coords)
-
         right_layout.addWidget(lbl_dest)
         right_layout.addWidget(self.lbl_output_dir)
         right_layout.addWidget(self.btn_select_output)
+        
+        right_layout.addStretch()
 
-        right_layout.addStretch() # Empuja todo lo anterior hacia arriba
-
-        # --- AGREGANDO BARRA DE PROGRESO ---
         right_layout.addWidget(self.lbl_process_status)
         right_layout.addWidget(self.progress_bar)
         right_layout.addSpacing(10)
-        # -----------------------------------
-
         right_layout.addWidget(self.btn_process)
         right_layout.addWidget(self.btn_clear)
 
@@ -190,7 +202,6 @@ class MainView(QMainWindow):
 
         lbl_instr = QLabel("Tu firma actual:")
 
-        # Area de Previsualización
         self.lbl_preview = QLabel()
         self.lbl_preview.setFixedSize(400, 200)
         self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -217,10 +228,8 @@ class MainView(QMainWindow):
         layout.addStretch()
 
     def set_signature_image(self, path):
-        """Muestra la imagen en el recuadro de previsualización"""
         if path and os.path.exists(path):
             pixmap = QPixmap(path)
-            # Escalar manteniendo la relación de aspecto
             scaled_pixmap = pixmap.scaled(
                 self.lbl_preview.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
@@ -229,45 +238,31 @@ class MainView(QMainWindow):
             self.lbl_preview.setPixmap(scaled_pixmap)
             self.lbl_path_text.setText(f"Ruta: {path}")
 
-            # Actualizar estado visual de la pestaña principal
-            self.lbl_signature_status.setText(
-                "✅ Firma Digital Cargada\nLista para usar."
-            )
-            self.lbl_signature_status.setStyleSheet(
-                "color: #00ff00; font-weight: bold;"
-            )
+            self.lbl_signature_status.setText("✅ Firma Digital Cargada\nLista para usar.")
+            self.lbl_signature_status.setStyleSheet("color: #009900; font-weight: bold;")
             self.btn_process.setEnabled(True)
         else:
             self.lbl_preview.clear()
             self.lbl_preview.setText("❌ No se encontró el archivo de firma")
             self.lbl_path_text.setText("Ruta: No válida")
-
-            self.lbl_signature_status.setText(
-                "❌ Falta Configurar Firma.\nVe a la pestaña 'Mi Firma'."
-            )
-            self.lbl_signature_status.setStyleSheet(
-                "color: #ff5555; font-weight: bold;"
-            )
+            self.lbl_signature_status.setText("❌ Falta Configurar Firma.\nVe a la pestaña 'Mi Firma'.")
+            self.lbl_signature_status.setStyleSheet("color: #ff5555; font-weight: bold;")
             self.btn_process.setEnabled(False)
 
     def setup_admin_tab(self):
         layout = QHBoxLayout(self.tab_admin)
 
-        # Panel Izquierdo
         left_panel = QVBoxLayout()
         lbl_create = QLabel("Crear Nuevo Usuario")
         lbl_create.setObjectName("Header")
 
         self.txt_new_user = QLineEdit()
         self.txt_new_user.setPlaceholderText("Nombre de Usuario")
-
         self.txt_new_pass = QLineEdit()
         self.txt_new_pass.setPlaceholderText("Contraseña")
         self.txt_new_pass.setEchoMode(QLineEdit.EchoMode.Password)
-
         self.cmb_role = QComboBox()
         self.cmb_role.addItems(["ingeniero", "admin"])
-
         self.btn_create_user = QPushButton("Crear Usuario")
 
         left_panel.addWidget(lbl_create)
@@ -277,7 +272,6 @@ class MainView(QMainWindow):
         left_panel.addWidget(self.btn_create_user)
         left_panel.addStretch()
 
-        # Panel Derecho
         right_panel = QVBoxLayout()
         lbl_list = QLabel("Usuarios Existentes")
         lbl_list.setObjectName("Header")
@@ -285,21 +279,14 @@ class MainView(QMainWindow):
         self.table_users = QTableWidget()
         self.table_users.setColumnCount(3)
         self.table_users.setHorizontalHeaderLabels(["ID", "Usuario", "Rol"])
-        self.table_users.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        self.table_users.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.table_users.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
+        self.table_users.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_users.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_users.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table_users.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
         actions_layout = QHBoxLayout()
         self.btn_delete_user = QPushButton("Eliminar Usuario")
         self.btn_delete_user.setStyleSheet("background-color: #d9534f;")
-
         self.btn_reset_pass = QPushButton("Resetear Password")
         self.btn_reset_pass.setStyleSheet("background-color: #f0ad4e; color: black;")
 
@@ -315,22 +302,15 @@ class MainView(QMainWindow):
 
     def update_signature_status_label(self):
         if self.user_data.get("signature_path"):
-            self.lbl_signature_status.setText(
-                "✅ Firma Digital Cargada\nLista para usar."
-            )
-            self.lbl_signature_status.setStyleSheet(
-                "color: #00ff00; font-weight: bold;"
-            )
+            self.lbl_signature_status.setText("✅ Firma Digital Cargada\nLista para usar.")
+            self.lbl_signature_status.setStyleSheet("color: #009900; font-weight: bold;")
             self.btn_process.setEnabled(True)
         else:
-            self.lbl_signature_status.setText(
-                "❌ NO tienes firma configurada.\nVe a la pestaña 'Mi Firma'."
-            )
-            self.lbl_signature_status.setStyleSheet(
-                "color: #ff5555; font-weight: bold;"
-            )
+            self.lbl_signature_status.setText("❌ NO tienes firma configurada.\nVe a la pestaña 'Mi Firma'.")
+            self.lbl_signature_status.setStyleSheet("color: #ff5555; font-weight: bold;")
             self.btn_process.setEnabled(False)
 
+    # --- EVENTOS DRAG & DROP MODIFICADOS ---
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.accept()
@@ -341,7 +321,8 @@ class MainView(QMainWindow):
         event.accept()
 
     def dropEvent(self, event):
-        files = [u.toLocalFile() for u in event.mimeData().urls()]
-        for f in files:
-            if f.lower().endswith(".pdf"):
-                self.list_files.addItem(f)
+        # NO PROCESAMOS AQUÍ. SOLO EMITIMOS LA SEÑAL.
+        urls = event.mimeData().urls()
+        if urls:
+            files = [u.toLocalFile() for u in urls]
+            self.files_dropped.emit(files)

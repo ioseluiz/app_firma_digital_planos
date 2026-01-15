@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QStyle 
 )
 from PyQt6.QtGui import QIcon, QColor 
-from PyQt6.QtCore import Qt # Necesario para guardar datos en items
+from PyQt6.QtCore import Qt 
 
 from app.views.main_view import MainView
 from app.views.login_view import LoginView
@@ -18,6 +18,7 @@ import os
 import shutil
 from app.utils.paths import get_app_data_path
 from app.workers.signing_worker import SigningWorker
+from app.workers.loader_worker import FileLoaderWorker  # Worker de carga
 
 class MainController:
     def __init__(self):
@@ -25,9 +26,10 @@ class MainController:
         self.login_view = None
         self.main_view = None
         self.current_user = None
-        self.worker = None 
+        self.worker = None        # Worker de firma
+        self.loader_worker = None # Worker de carga
 
-        self.is_dark_mode = True
+        self.is_dark_mode = False
         self.output_directory = None
         self.custom_coords = None
 
@@ -60,15 +62,20 @@ class MainController:
         self.main_view.btn_set_coords.clicked.connect(self.open_coordinate_selector)
         self.main_view.btn_process.clicked.connect(self.process_signing)
         
-        # --- NUEVA CONEXIÓN: DOBLE CLIC PARA EDITAR ---
+        # Doble clic para editar posición individual
         self.main_view.list_files.itemDoubleClicked.connect(self.edit_single_file_position)
 
+        # CONEXIÓN DROP: Cuando la vista recibe archivos, llamamos a la carga asíncrona
+        self.main_view.files_dropped.connect(self.load_files_async)
+
+        # Pestaña Configuración
         if hasattr(self.main_view, "btn_upload_sig"):
             self.main_view.btn_upload_sig.clicked.connect(self.upload_signature)
             existing_sig = self.current_user.get("signature_path")
             if existing_sig:
                 self.main_view.set_signature_image(existing_sig)
 
+        # Pestaña Admin
         if self.current_user["role"] == "admin":
             self.main_view.btn_create_user.clicked.connect(self.create_user)
             self.main_view.btn_delete_user.clicked.connect(self.delete_user)
@@ -91,33 +98,62 @@ class MainController:
             self.is_dark_mode = True
 
     # --------------------------------------------------------------------------
-    # LÓGICA DE FIRMA Y ARCHIVOS
+    # LÓGICA DE CARGA DE ARCHIVOS (ASÍNCRONA)
     # --------------------------------------------------------------------------
     def select_files(self):
+        """Botón 'Seleccionar PDFs'"""
         files, _ = QFileDialog.getOpenFileNames(
             self.main_view, "Seleccionar Planos", "", "PDF Files (*.pdf)"
         )
         if files:
-            self.main_view.list_files.addItems(files)
+            self.load_files_async(files)
 
+    def load_files_async(self, raw_paths):
+        """Inicia el hilo de carga para evitar congelamiento"""
+        if not raw_paths: return
+
+        # Bloquear UI y mostrar progreso
+        self.main_view.btn_process.setEnabled(False)
+        self.main_view.progress_bar.setVisible(True)
+        self.main_view.progress_bar.setValue(0)
+        self.main_view.lbl_process_status.setText(f"Analizando {len(raw_paths)} archivos...")
+
+        # Configurar y arrancar worker
+        self.loader_worker = FileLoaderWorker(raw_paths)
+        self.loader_worker.progress_updated.connect(self.main_view.progress_bar.setValue)
+        self.loader_worker.finished_signal.connect(self.on_files_loaded)
+        self.loader_worker.start()
+
+    def on_files_loaded(self, valid_pdfs):
+        """Callback al terminar la carga"""
+        if valid_pdfs:
+            # addItems es mucho más rápido que un bucle
+            self.main_view.list_files.addItems(valid_pdfs)
+            self.main_view.lbl_process_status.setText(f"Listo: {len(valid_pdfs)} nuevos archivos cargados.")
+        else:
+            self.main_view.lbl_process_status.setText("No se encontraron archivos PDF válidos.")
+
+        # Restaurar UI
+        self.main_view.progress_bar.setVisible(False)
+        self.main_view.btn_process.setEnabled(True)
+        self.loader_worker = None
+
+    # --------------------------------------------------------------------------
+    # OTRAS FUNCIONES (SELECCIÓN, EDICIÓN, FIRMA)
+    # --------------------------------------------------------------------------
     def select_output_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self.main_view, "Seleccionar Carpeta de Destino"
-        )
+        folder = QFileDialog.getExistingDirectory(self.main_view, "Seleccionar Carpeta de Destino")
         if folder:
             self.output_directory = folder
             self.main_view.lbl_output_dir.setText(f"Destino: {folder}")
             self.main_view.lbl_output_dir.setStyleSheet("color: #00aaff; font-weight: bold; font-size: 11px;")
 
     def open_coordinate_selector(self):
-        """Define la posición global (por defecto)"""
         if self.main_view.list_files.count() == 0:
             QMessageBox.warning(self.main_view, "Atención", "Primero agrega archivos PDF.")
             return
-
         ref_pdf_path = self.main_view.list_files.item(0).text()
         selector = SelectorView(ref_pdf_path)
-
         if selector.exec():
             geometry = selector.get_geometry()
             if geometry:
@@ -130,43 +166,23 @@ class MainController:
                 self.main_view.lbl_coords_status.setText("Posición: Predeterminada")
                 self.main_view.lbl_coords_status.setStyleSheet("color: #888;")
 
-    # --- NUEVO MÉTODO: EDITOR INDIVIDUAL ---
     def edit_single_file_position(self, item):
-        """Abre el selector solo para el archivo seleccionado"""
-        # Obtenemos la ruta. Si ya tiene alias, la ruta real está en UserRole+1
         pdf_path = item.data(Qt.ItemDataRole.UserRole + 1)
-        if not pdf_path:
-            pdf_path = item.text()
+        if not pdf_path: pdf_path = item.text()
         
-        # 1. ¿Tiene coords propias ya guardadas?
         current_coords = item.data(Qt.ItemDataRole.UserRole)
+        if not current_coords: current_coords = self.custom_coords
+        if not current_coords: current_coords = (400, 700, 150, 60)
         
-        # 2. Si no, ¿usamos las globales?
-        if not current_coords:
-            current_coords = self.custom_coords
-            
-        # 3. Si no, usamos default (400, 700...) para pintar algo
-        if not current_coords:
-            current_coords = (400, 700, 150, 60)
-
-        # Abrir Selector pasando las coordenadas actuales para pre-visualizar
         selector = SelectorView(pdf_path, initial_coords=current_coords)
-        
         if selector.exec():
             new_coords = selector.get_geometry()
             if new_coords:
-                # GUARDAMOS LAS COORDENADAS EN EL ÍTEM MISMO
                 item.setData(Qt.ItemDataRole.UserRole, new_coords)
-                
-                # Feedback visual en la lista
                 base_name = os.path.basename(pdf_path)
                 item.setText(f"{base_name} (Posición Personalizada ✏️)")
                 item.setToolTip(f"Coordenadas personalizadas: {new_coords}")
-                
-                # Guardamos la ruta real en otro rol para no perderla al cambiar el texto
                 item.setData(Qt.ItemDataRole.UserRole + 1, pdf_path) 
-                
-                # Quitamos iconos de estado anteriores
                 item.setIcon(QIcon())
                 item.setBackground(QColor(0,0,0,0))
 
@@ -203,34 +219,20 @@ class MainController:
             QMessageBox.warning(self.main_view, "Atención", "No has seleccionado ningún archivo PDF.")
             return
         
-        # CONSTRUIR LA LISTA DE TAREAS INTELIGENTE
         work_queue = []
-        
         for i in range(count):
             item = self.main_view.list_files.item(i)
-            
-            # Recuperar ruta (priorizando la data oculta si se editó el nombre)
             path = item.data(Qt.ItemDataRole.UserRole + 1)
-            if not path:
-                path = item.text()
-
-            # Recuperar Coordenadas (Prioridad: Individual > Global > Default)
+            if not path: path = item.text()
             coords = item.data(Qt.ItemDataRole.UserRole)
-            if not coords:
-                coords = self.custom_coords # Globales
+            if not coords: coords = self.custom_coords 
             
-            # Limpiar estado visual
+            # Limpiar estado visual previo
             item.setIcon(QIcon())
             item.setBackground(QColor(0,0,0,0))
-            if "Personalizada" not in item.text():
-                 item.setToolTip("")
+            if "Personalizada" not in item.text(): item.setToolTip("")
             
-            # Agregar a la cola: Objeto con path y coords
-            work_queue.append({
-                'path': path,
-                'coords': coords, 
-                'list_index': i
-            })
+            work_queue.append({'path': path, 'coords': coords, 'list_index': i})
 
         self.main_view.btn_process.setEnabled(False)
         self.main_view.btn_clear.setEnabled(False)
@@ -238,18 +240,11 @@ class MainController:
         self.main_view.progress_bar.setValue(0)
         self.main_view.lbl_process_status.setText("Iniciando motor de firma...")
 
-        # INICIAR WORKER CON LA NUEVA ESTRUCTURA
-        self.worker = SigningWorker(
-            work_queue=work_queue, # Pasamos la cola inteligente
-            sig_path=sig_path,
-            output_dir=self.output_directory
-        )
-        
+        self.worker = SigningWorker(work_queue, sig_path, self.output_directory)
         self.worker.progress_updated.connect(self.update_progress)
         self.worker.status_updated.connect(self.update_status_label)
         self.worker.finished_signal.connect(self.on_signing_finished)
         self.worker.file_processed.connect(self.on_file_processed)
-        
         self.worker.start()
 
     def update_progress(self, val):
@@ -268,7 +263,7 @@ class MainController:
         else:
             icon = self.main_view.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxCritical)
             item.setIcon(icon)
-            bg_color = QColor("#500000") if self.is_dark_mode else QColor("#ffe6e6")
+            bg_color = QColor("#500000") if self.is_dark_mode else QColor("#ffcccc")
             item.setBackground(bg_color)
             item.setToolTip(f"❌ ERROR: {msg}")
 
@@ -280,7 +275,7 @@ class MainController:
         QMessageBox.information(self.main_view, "Reporte Final", report_msg)
         self.worker = None
 
-    # --- CRUD USUARIOS (Sin cambios) ---
+    # --- CRUD USUARIOS ---
     def load_user_list(self):
         users = self.user_model.get_all_users()
         self.main_view.table_users.setRowCount(0)
