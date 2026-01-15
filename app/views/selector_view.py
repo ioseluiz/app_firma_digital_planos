@@ -48,12 +48,15 @@ class PDFLabel(QLabel):
             painter.end()
 
 class SelectorView(QDialog):
-    def __init__(self, pdf_path):
+    def __init__(self, pdf_path, initial_coords=None):
         super().__init__()
-        self.setWindowTitle("Selector Final - Posición Restaurada")
+        self.setWindowTitle("Editor de Posición - Ajuste Fino")
         self.resize(1000, 800)
         self.pdf_path = pdf_path
-        self.selected_geometry = None 
+        
+        # Coordenadas iniciales (x, y, w, h) reales del PDF
+        self.selected_geometry = initial_coords 
+        
         self.scale_factor = 1.0 
         self.page_rotation = 0
         self.page_rect = None
@@ -96,41 +99,74 @@ class SelectorView(QDialog):
             self.pdf_label.setPixmap(QPixmap.fromImage(img))
             self.scale_factor = zoom 
             doc.close()
+
+            # --- SI HAY COORDENADAS PREVIAS, DIBUJARLAS ---
+            if self.selected_geometry:
+                rx, ry, rw, rh = self.selected_geometry
+                vx, vy, vw, vh = self._map_pdf_rect_to_visual(rx, ry, rw, rh)
+                
+                # Establecer el rectángulo visual
+                self.pdf_label.current_rect = QRect(int(vx), int(vy), int(vw), int(vh))
+                self.pdf_label.update()
+                
+                # Activar botón
+                self.btn_confirm.setEnabled(True)
+                self.btn_confirm.setText(f"Confirmar (X:{int(rx)}, Y:{int(ry)})")
+
         except Exception as e:
             print(f"Error: {str(e)}")
 
     def _map_visual_point_to_pdf(self, visual_x, visual_y):
-        """
-        Mapea coordenadas visuales a coordenadas PDF.
-        RESTAURADA la lógica que funcionó para la posición (usando height para 270°).
-        """
+        """Mapea coordenadas visuales a coordenadas PDF (Lógica probada)."""
         rot = self.page_rotation % 360
         r = self.page_rect
         
         if rot == 0:
             return r.x0 + visual_x, r.y0 + visual_y
-            
         elif rot == 90:
             return r.x0 + visual_y, r.x1 - visual_x
-            
         elif rot == 180:
             return r.x1 - visual_x, r.y1 - visual_y
-            
         elif rot == 270:
-            # --- LÓGICA RESTAURADA ---
-            # En el intento exitoso, usamos r.height (2004) para calcular X.
-            # Visual Y (0..2004) se invierte para mapear a PDF X.
+            # Lógica para planos verticales (Landscape en PDF)
             pdf_x = r.height - visual_y
-            
-            # Ajuste de origen si existe
-            if r.x0 != 0:
-                 pdf_x = (r.x0 + r.height) - visual_y
-
+            if r.x0 != 0: pdf_x = (r.x0 + r.height) - visual_y
             pdf_y = r.y0 + visual_x
-            
             return pdf_x, pdf_y
             
         return r.x0 + visual_x, r.y0 + visual_y
+
+    def _map_pdf_rect_to_visual(self, x, y, w, h):
+        """Convierte coordenadas PDF a visuales para pintar el recuadro inicial."""
+        rot = self.page_rotation % 360
+        r = self.page_rect
+        
+        # Invertir la lógica de _map_visual_point_to_pdf
+        if rot == 0:
+            vx = x - r.x0
+            vy = y - r.y0
+            vw, vh = w, h
+        elif rot == 90:
+            # En 90: PDF X viene de Visual Y. PDF Y viene de Inverted Visual X
+            vx = r.x1 - y
+            vy = x - r.x0
+            vw, vh = h, w # Dimensiones invertidas
+        elif rot == 180:
+            vx = r.x1 - x
+            vy = r.y1 - y
+            vw, vh = w, h
+        elif rot == 270:
+            # Inverso de la lógica 270
+            offset_x = (r.x0 + r.height) if r.x0 != 0 else r.height
+            vy = offset_x - x
+            vx = y - r.y0
+            vw, vh = h, w # Dimensiones invertidas
+        else:
+            vx, vy, vw, vh = x, y, w, h
+
+        # Aplicar escala (Zoom)
+        return (vx * self.scale_factor, vy * self.scale_factor, 
+                vw * self.scale_factor, vh * self.scale_factor)
 
     def handle_selection(self, x, y, w, h):
         vx, vy = x / self.scale_factor, y / self.scale_factor
@@ -144,7 +180,7 @@ class SelectorView(QDialog):
         final_rect = fitz.Rect(p1_x, p1_y, p2_x, p2_y).normalize()
         real_x, real_y = final_rect.x0, final_rect.y0
         
-        # 3. Intercambio de dimensiones
+        # 3. Intercambio de dimensiones si hay rotación
         rot = self.page_rotation % 360
         if rot == 90 or rot == 270:
             real_w = vh
