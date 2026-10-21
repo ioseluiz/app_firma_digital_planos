@@ -1,328 +1,195 @@
+"""Ventana principal: navegador de hojas | lienzo de la hoja | propiedades."""
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
-    QMainWindow,
+    QLabel, QMainWindow, QProgressBar, QPushButton, QSizePolicy, QSplitter, QToolBar, QVBoxLayout,
     QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QPushButton,
-    QListWidget,
-    QLabel,
-    QFileDialog,
-    QMessageBox,
-    QTabWidget,
-    QLineEdit,
-    QComboBox,
-    QTableWidget,
-    QTableWidgetItem,
-    QHeaderView,
-    QAbstractItemView,
-    QInputDialog,
-    QProgressBar
 )
-from PyQt6.QtGui import QPixmap
-from PyQt6.QtCore import Qt, pyqtSignal  # Importante: pyqtSignal para avisar del drop
-from app.views.styles import THEMES
-import os
+
+from app.utils import geometry
+from app.views.icons import icon
+from app.views.page_canvas import PageCanvas
+from app.views.page_navigator import PageNavigator
+from app.views.properties_panel import PropertiesPanel
+from app.views.styles import THEMES, TOKENS
 
 
 class MainView(QMainWindow):
-    # Señal para avisar al controlador que se soltaron archivos
-    files_dropped = pyqtSignal(list)
+    closing = pyqtSignal()
 
-    def __init__(self, user_data):
+    def __init__(self, owner_name, theme="light"):
         super().__init__()
-        self.user_data = user_data
-        self.setWindowTitle(f"DigitalSealer - Usuario: {user_data['username']}")
-        self.resize(1000, 700)
+        self.setWindowTitle(f"DigitalSealer · {owner_name}")
+        self.resize(1440, 900)
+        self.setMinimumSize(1000, 640)
+        self.theme = theme
+        t = TOKENS[theme]
 
-        # Tema Inicial
-        self.setStyleSheet(THEMES["light"])
+        # --- Barra de herramientas -----------------------------------------
+        tb = QToolBar("Principal")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(20, 20))
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.addToolBar(tb)
+        self.toolbar = tb
 
-        # Widget Central
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        self.main_layout = QVBoxLayout(central_widget)
+        self.act_open = QAction("Abrir PDFs", self)
+        self.act_open.setShortcut(QKeySequence.StandardKey.Open)
+        self.act_open.setToolTip("Abrir planos o reportes PDF (también puedes arrastrarlos) · Ctrl+O")
+        self.act_clear = QAction("Limpiar", self)
+        self.act_clear.setToolTip("Quitar todos los archivos de la lista")
+        self.act_stamp = QAction("Mi sello", self)
+        self.act_verify = QAction("Verificar", self)
+        self.act_verify.setToolTip("Comprobar si un PDF fue emitido por ti y no fue modificado")
+        self.act_undo = QAction("Deshacer", self)
+        self.act_undo.setShortcut(QKeySequence.StandardKey.Undo)
+        self.act_redo = QAction("Rehacer", self)
+        self.act_redo.setShortcuts([QKeySequence.StandardKey.Redo, QKeySequence("Ctrl+Y")])
+        self.act_zoom_out = QAction("", self)
+        self.act_zoom_out.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        self.act_zoom_out.setToolTip("Alejar (Ctrl+-)")
+        self.act_zoom_in = QAction("", self)
+        self.act_zoom_in.setShortcuts([QKeySequence.StandardKey.ZoomIn, QKeySequence("Ctrl+=")])
+        self.act_zoom_in.setToolTip("Acercar (Ctrl++)")
+        self.act_fit = QAction("Ajustar", self)
+        self.act_fit.setShortcut(QKeySequence("Ctrl+0"))
+        self.act_fit.setToolTip("Ver la hoja completa (Ctrl+0)")
+        self.act_prev = QAction("Hoja anterior", self)
+        self.act_prev.setShortcut(QKeySequence(Qt.Key.Key_PageUp))
+        self.act_next = QAction("Hoja siguiente", self)
+        self.act_next.setShortcut(QKeySequence(Qt.Key.Key_PageDown))
+        self.act_theme = QAction("", self)
+        self.act_theme.setToolTip("Cambiar tema claro/oscuro")
+        self.act_lock = QAction("Bloquear", self)
+        self.act_lock.setShortcut(QKeySequence("Ctrl+L"))
+        self.act_lock.setToolTip("Bloquear la aplicación (Ctrl+L)")
+        self.addActions([self.act_prev, self.act_next])
 
-        # --- HEADER ---
-        header_layout = QHBoxLayout()
-        role_text = "Administrador" if user_data["role"] == "admin" else "Ingeniero"
-        self.lbl_info = QLabel(f"Rol: {role_text}")
+        tb.addAction(self.act_open)
+        tb.addAction(self.act_clear)
+        tb.addSeparator()
+        tb.addAction(self.act_stamp)
+        tb.addAction(self.act_verify)
+        tb.addSeparator()
+        tb.addAction(self.act_undo)
+        tb.addAction(self.act_redo)
+        tb.addSeparator()
+        tb.addAction(self.act_zoom_out)
+        self.lbl_zoom = QLabel("100 %")
+        self.lbl_zoom.setMinimumWidth(52)
+        self.lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tb.addWidget(self.lbl_zoom)
+        tb.addAction(self.act_zoom_in)
+        tb.addAction(self.act_fit)
+        spacer = QWidget()
+        spacer.setObjectName("spacer")
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        tb.addAction(self.act_theme)
+        tb.addAction(self.act_lock)
+        self.btn_seal = QPushButton("Sellar")
+        self.btn_seal.setProperty("variant", "primary")
+        self.btn_seal.setMinimumHeight(34)
+        self.btn_seal.setMinimumWidth(170)
+        tb.addWidget(self.btn_seal)
 
-        self.btn_toggle_theme = QPushButton("☀️ / 🌙")
-        self.btn_toggle_theme.setFixedWidth(100)
-        self.btn_toggle_theme.setToolTip("Cambiar Tema")
+        # --- Paneles --------------------------------------------------------
+        self.navigator = PageNavigator(t)
+        self.canvas = PageCanvas(t)
+        self.properties = PropertiesPanel(t)
 
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(0)
+        hdr = QLabel("  ARCHIVOS Y HOJAS")
+        hdr.setProperty("role", "section")
+        hdr.setMinimumHeight(30)
+        ll.addWidget(hdr)
+        ll.addWidget(self.navigator)
 
-        # Estilo específico para este botón (Gris oscuro, letra grande)
-        # Esto garantiza contraste perfecto en ambos temas.
-        self.btn_toggle_theme.setStyleSheet("""
-            QPushButton {
-                background-color: #444444;
-                color: #ffffff;
-                font-size: 18px;
-                border: 1px solid #666;
-                border-radius: 5px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #666666;
-            }
-        """)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(left)
+        split.addWidget(self.canvas)
+        split.addWidget(self.properties)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setStretchFactor(2, 0)
+        split.setSizes([280, 820, 340])
+        split.setChildrenCollapsible(False)
+        left.setMinimumWidth(220)
+        self.properties.setMinimumWidth(320)
+        self.setCentralWidget(split)
 
-        self.btn_logout = QPushButton("Cerrar Sesión")
-        self.btn_logout.setStyleSheet("background-color: #d9534f;")
+        # --- Barra de estado -------------------------------------------------
+        sb = self.statusBar()
+        self.lbl_status = QLabel("Listo")
+        self.lbl_cursor = QLabel("")
+        self.lbl_cursor.setMinimumWidth(170)
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(220)
+        self.progress.setVisible(False)
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_cancel.setVisible(False)
+        sb.addWidget(self.lbl_status, 1)
+        sb.addPermanentWidget(self.progress)
+        sb.addPermanentWidget(self.btn_cancel)
+        sb.addPermanentWidget(self.lbl_cursor)
 
-        header_layout.addWidget(self.lbl_info)
-        header_layout.addStretch()
-        header_layout.addWidget(self.btn_toggle_theme)
-        header_layout.addWidget(self.btn_logout)
+        self.canvas.zoom_changed.connect(lambda z: self.lbl_zoom.setText(f"{z * 100:.0f} %"))
+        self.canvas.cursor_moved.connect(self._show_cursor)
+        self.set_theme(theme)
 
-        self.main_layout.addLayout(header_layout)
+    # ------------------------------------------------------------ helpers
+    def set_theme(self, theme):
+        self.theme = theme
+        t = TOKENS[theme]
+        self.setStyleSheet(THEMES[theme])
+        c = t["text"]
+        self.act_open.setIcon(icon("open", c))
+        self.act_clear.setIcon(icon("clear", c))
+        self.act_stamp.setIcon(icon("stamp", c))
+        self.act_verify.setIcon(icon("verify", c))
+        self.act_undo.setIcon(icon("undo", c))
+        self.act_redo.setIcon(icon("redo", c))
+        self.act_zoom_in.setIcon(icon("zoom_in", c))
+        self.act_zoom_out.setIcon(icon("zoom_out", c))
+        self.act_fit.setIcon(icon("fit", c))
+        self.act_lock.setIcon(icon("lock", c))
+        self.act_theme.setIcon(icon("sun" if theme == "dark" else "moon", c))
+        self.btn_seal.setIcon(icon("seal", t["accent_text"]))
+        self.navigator.set_tokens(t)
+        self.canvas.set_tokens(t)
+        self.properties.set_tokens(t)
 
-        # Tabs
-        self.tabs = QTabWidget()
-        self.main_layout.addWidget(self.tabs)
-
-        # Tab 1: Firmar
-        self.tab_signing = QWidget()
-        self.setup_signing_tab()
-        self.tabs.addTab(self.tab_signing, "Firmar Planos")
-
-        # Tab 2: Configuración (Ingenieros)
-        if user_data["role"] != "admin":
-            self.tab_config = QWidget()
-            self.setup_config_tab()
-            self.tabs.addTab(self.tab_config, "Mi Firma Digital")
-
-        # Tab 3: Admin (Administradores)
-        if user_data["role"] == "admin":
-            self.tab_admin = QWidget()
-            self.setup_admin_tab()
-            self.tabs.addTab(self.tab_admin, "Administración")
-
-    def set_theme(self, theme_name):
-        if theme_name in THEMES:
-            self.setStyleSheet(THEMES[theme_name])
-
-    def setup_signing_tab(self):
-        layout = QHBoxLayout(self.tab_signing)
-
-        # --- COLUMNA IZQUIERDA: Lista Archivos ---
-        left_layout = QVBoxLayout()
-        lbl_instr = QLabel("1. Arrastra archivos PDF aquí:")
-        self.btn_add_files = QPushButton("Seleccionar PDFs")
-        
-        self.list_files = QListWidget()
-        self.list_files.setAcceptDrops(True)
-        self.list_files.setDragDropMode(QListWidget.DragDropMode.DropOnly)
-        # Conectamos los eventos de drag & drop propios de la clase
-        self.list_files.dragEnterEvent = self.dragEnterEvent
-        self.list_files.dragMoveEvent = self.dragMoveEvent
-        self.list_files.dropEvent = self.dropEvent
-
-        left_layout.addWidget(lbl_instr)
-        left_layout.addWidget(self.btn_add_files)
-        left_layout.addWidget(self.list_files)
-
-        # --- COLUMNA DERECHA: Configuración y Acciones ---
-        right_layout = QVBoxLayout()
-
-        self.lbl_signature_status = QLabel()
-        self.lbl_signature_status.setWordWrap(True)
-
-        # --- SECCION DE COORDENADAS ---
-        lbl_coords = QLabel("2. Posición de la Firma:")
-        lbl_coords.setStyleSheet("font-weight: bold; margin-top: 10px;")
-
-        self.lbl_coords_status = QLabel("Posición: Predeterminada (400, 700)")
-        self.lbl_coords_status.setStyleSheet("color: #888; font-size: 12px;")
-
-        self.btn_set_coords = QPushButton("📍 Definir visualmente")
-        self.btn_set_coords.setToolTip(
-            "Abre una previsualización del primer PDF para hacer clic donde va la firma"
-        )
-        self.btn_set_coords.setStyleSheet(
-            "background-color: #f0ad4e; color: black;"
-        )
-
-        # --- SECCION CARPETA SALIDA ---
-        lbl_dest = QLabel("3. Carpeta Destino:")
-        lbl_dest.setStyleSheet("font-weight: bold; margin-top: 10px;")
-
-        self.lbl_output_dir = QLabel("Destino: Carpeta original del archivo")
-        self.lbl_output_dir.setWordWrap(True)
-        self.lbl_output_dir.setStyleSheet(
-            "color: #888; font-style: italic; font-size: 11px;"
-        )
-
-        self.btn_select_output = QPushButton("Cambiar Carpeta Destino")
-        self.btn_select_output.setStyleSheet("background-color: #5bc0de; color: white;")
-
-        # --- BARRA DE PROGRESO ---
-        self.lbl_process_status = QLabel("Listo")
-        self.lbl_process_status.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.lbl_process_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setVisible(False)
-
-        # Botones de Acción
-        self.btn_process = QPushButton("4. Ejecutar Firmado")
-        self.btn_process.setMinimumHeight(50)
-        self.btn_clear = QPushButton("Limpiar Lista")
-
-        # Armado del layout derecho
-        right_layout.addWidget(self.lbl_signature_status)
-        right_layout.addWidget(lbl_coords)
-        right_layout.addWidget(self.lbl_coords_status)
-        right_layout.addWidget(self.btn_set_coords)
-        right_layout.addWidget(lbl_dest)
-        right_layout.addWidget(self.lbl_output_dir)
-        right_layout.addWidget(self.btn_select_output)
-        
-        right_layout.addStretch()
-
-        right_layout.addWidget(self.lbl_process_status)
-        right_layout.addWidget(self.progress_bar)
-        right_layout.addSpacing(10)
-        right_layout.addWidget(self.btn_process)
-        right_layout.addWidget(self.btn_clear)
-
-        layout.addLayout(left_layout, 60)
-        layout.addLayout(right_layout, 40)
-
-        self.update_signature_status_label()
-
-    def setup_config_tab(self):
-        layout = QVBoxLayout(self.tab_config)
-
-        lbl_info = QLabel("Configuración de Firma Digital")
-        lbl_info.setObjectName("Header")
-
-        lbl_instr = QLabel("Tu firma actual:")
-
-        self.lbl_preview = QLabel()
-        self.lbl_preview.setFixedSize(400, 200)
-        self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_preview.setStyleSheet("""
-            border: 2px dashed #555; 
-            background-color: rgba(0,0,0,0.1);
-            border-radius: 10px;
-        """)
-        self.lbl_preview.setText("Sin firma cargada")
-
-        self.lbl_path_text = QLabel("Ruta: Ninguna")
-        self.lbl_path_text.setStyleSheet("color: #888; font-size: 11px;")
-
-        self.btn_upload_sig = QPushButton("Cargar / Cambiar Firma")
-        self.btn_upload_sig.setFixedWidth(200)
-
-        layout.addWidget(lbl_info)
-        layout.addSpacing(10)
-        layout.addWidget(lbl_instr)
-        layout.addWidget(self.lbl_preview)
-        layout.addWidget(self.lbl_path_text)
-        layout.addSpacing(10)
-        layout.addWidget(self.btn_upload_sig)
-        layout.addStretch()
-
-    def set_signature_image(self, path):
-        if path and os.path.exists(path):
-            pixmap = QPixmap(path)
-            scaled_pixmap = pixmap.scaled(
-                self.lbl_preview.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self.lbl_preview.setPixmap(scaled_pixmap)
-            self.lbl_path_text.setText(f"Ruta: {path}")
-
-            self.lbl_signature_status.setText("✅ Firma Digital Cargada\nLista para usar.")
-            self.lbl_signature_status.setStyleSheet("color: #009900; font-weight: bold;")
-            self.btn_process.setEnabled(True)
+    def set_seal_count(self, pages, files):
+        if pages:
+            self.btn_seal.setText(f"Sellar {pages} hoja{'s' if pages != 1 else ''}")
+            self.btn_seal.setToolTip(f"{pages} hojas en {files} archivo{'s' if files != 1 else ''}")
         else:
-            self.lbl_preview.clear()
-            self.lbl_preview.setText("❌ No se encontró el archivo de firma")
-            self.lbl_path_text.setText("Ruta: No válida")
-            self.lbl_signature_status.setText("❌ Falta Configurar Firma.\nVe a la pestaña 'Mi Firma'.")
-            self.lbl_signature_status.setStyleSheet("color: #ff5555; font-weight: bold;")
-            self.btn_process.setEnabled(False)
+            self.btn_seal.setText("Sellar")
+            self.btn_seal.setToolTip("No hay hojas con sello")
+        self.btn_seal.setEnabled(pages > 0)
 
-    def setup_admin_tab(self):
-        layout = QHBoxLayout(self.tab_admin)
+    def set_busy(self, busy, cancellable=False):
+        self.progress.setVisible(busy)
+        self.btn_cancel.setVisible(busy and cancellable)
+        if busy:
+            self.progress.setValue(0)
+        for w in (self.act_open, self.act_clear, self.act_stamp):
+            w.setEnabled(not busy)
+        if busy:
+            self.btn_seal.setEnabled(False)
 
-        left_panel = QVBoxLayout()
-        lbl_create = QLabel("Crear Nuevo Usuario")
-        lbl_create.setObjectName("Header")
+    def set_status(self, text):
+        self.lbl_status.setText(text)
 
-        self.txt_new_user = QLineEdit()
-        self.txt_new_user.setPlaceholderText("Nombre de Usuario")
-        self.txt_new_pass = QLineEdit()
-        self.txt_new_pass.setPlaceholderText("Contraseña")
-        self.txt_new_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self.cmb_role = QComboBox()
-        self.cmb_role.addItems(["ingeniero", "admin"])
-        self.btn_create_user = QPushButton("Crear Usuario")
-
-        left_panel.addWidget(lbl_create)
-        left_panel.addWidget(self.txt_new_user)
-        left_panel.addWidget(self.txt_new_pass)
-        left_panel.addWidget(self.cmb_role)
-        left_panel.addWidget(self.btn_create_user)
-        left_panel.addStretch()
-
-        right_panel = QVBoxLayout()
-        lbl_list = QLabel("Usuarios Existentes")
-        lbl_list.setObjectName("Header")
-
-        self.table_users = QTableWidget()
-        self.table_users.setColumnCount(3)
-        self.table_users.setHorizontalHeaderLabels(["ID", "Usuario", "Rol"])
-        self.table_users.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table_users.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_users.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table_users.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-
-        actions_layout = QHBoxLayout()
-        self.btn_delete_user = QPushButton("Eliminar Usuario")
-        self.btn_delete_user.setStyleSheet("background-color: #d9534f;")
-        self.btn_reset_pass = QPushButton("Resetear Password")
-        self.btn_reset_pass.setStyleSheet("background-color: #f0ad4e; color: black;")
-
-        actions_layout.addWidget(self.btn_reset_pass)
-        actions_layout.addWidget(self.btn_delete_user)
-
-        right_panel.addWidget(lbl_list)
-        right_panel.addWidget(self.table_users)
-        right_panel.addLayout(actions_layout)
-
-        layout.addLayout(left_panel, 30)
-        layout.addLayout(right_panel, 70)
-
-    def update_signature_status_label(self):
-        if self.user_data.get("signature_path"):
-            self.lbl_signature_status.setText("✅ Firma Digital Cargada\nLista para usar.")
-            self.lbl_signature_status.setStyleSheet("color: #009900; font-weight: bold;")
-            self.btn_process.setEnabled(True)
+    def _show_cursor(self, pos):
+        if pos is None:
+            self.lbl_cursor.setText("")
         else:
-            self.lbl_signature_status.setText("❌ NO tienes firma configurada.\nVe a la pestaña 'Mi Firma'.")
-            self.lbl_signature_status.setStyleSheet("color: #ff5555; font-weight: bold;")
-            self.btn_process.setEnabled(False)
+            self.lbl_cursor.setText(f"X {geometry.pt_to_mm(pos[0]):7.1f} mm   Y {geometry.pt_to_mm(pos[1]):7.1f} mm")
 
-    # --- EVENTOS DRAG & DROP MODIFICADOS ---
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.accept()
-        else:
-            event.ignore()
-
-    def dragMoveEvent(self, event):
-        event.accept()
-
-    def dropEvent(self, event):
-        # NO PROCESAMOS AQUÍ. SOLO EMITIMOS LA SEÑAL.
-        urls = event.mimeData().urls()
-        if urls:
-            files = [u.toLocalFile() for u in urls]
-            self.files_dropped.emit(files)
+    def closeEvent(self, event):
+        self.closing.emit()
+        super().closeEvent(event)

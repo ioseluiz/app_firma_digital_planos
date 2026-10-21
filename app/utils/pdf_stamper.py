@@ -39,13 +39,16 @@ def block_size_mm(stamp_w_mm, stamp_h_mm):
     return stamp_w_mm, stamp_h_mm + ID_STRIP_MM
 
 
-def output_path_for(src_path, output_dir=None):
+def output_path_for(src_path, output_dir=None, taken=()):
+    """Ruta de salida libre: no existe, no es el original ni está en `taken` (otras salidas del lote)."""
     folder = output_dir or os.path.dirname(src_path)
     base = OUTPUT_PREFIX + os.path.basename(src_path)
     candidate = os.path.join(folder, base)
     stem, ext = os.path.splitext(candidate)
+    taken = {os.path.normcase(os.path.abspath(p)) for p in taken}
     n = 2
-    while os.path.exists(candidate) or os.path.abspath(candidate) == os.path.abspath(src_path):
+    while (os.path.exists(candidate) or os.path.abspath(candidate) == os.path.abspath(src_path)
+           or os.path.normcase(os.path.abspath(candidate)) in taken):
         candidate = f"{stem} ({n}){ext}"
         n += 1
     return candidate
@@ -66,7 +69,8 @@ def visual_to_insert_rect(page, vis):
 
 
 def generate_owner_password():
-    return secrets.token_urlsafe(32)
+    # 24 bytes → 32 caracteres (192 bits). MuPDF admite como máximo 40 caracteres.
+    return secrets.token_urlsafe(24)
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +207,7 @@ def stamp_document(src_path, out_path, placements, stamp_png, stamp_w_mm, stamp_
             bg.paste(block, (ox, oy), block)
 
             fused = io.BytesIO()
-            bg.save(fused, "PNG", optimize=True)
+            bg.save(fused, "PNG", compress_level=6)
 
             # Insertar en el contenido de la página
             page.insert_image(visual_to_insert_rect(page, vis), stream=fused.getvalue(), rotate=page.rotation,

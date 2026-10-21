@@ -165,3 +165,13 @@ def test_cad_page_with_offset_boxes(tmp_path, stamp_png, page_rot):
     assert ys.min() >= y0 - 2 and ys.max() <= y1 + 2
     # y el centro de la tinta está cerca del centro colocado
     assert abs((xs.min() + xs.max()) / 2 - cx) < 8 and abs((ys.min() + ys.max()) / 2 - cy) < 8
+
+
+def test_generated_owner_password_is_accepted(pdf_factory, stamp_png, tmp_path):
+    pw = pdf_stamper.generate_owner_password()
+    assert len(pw) <= 40
+    src = pdf_factory([LETTER])
+    out = str(tmp_path / "pw.pdf")
+    pdf_stamper.stamp_document(src, out, [(0, 300, 400, 0)], stamp_png, STAMP_W_MM, STAMP_H_MM, KEY, pw)
+    with pymupdf.open(out) as d:
+        assert d.authenticate(pw) == 4  # 4 = autenticado como propietario
