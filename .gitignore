@@ -6,3 +6,12 @@ prompt.md
 config.ini
 dist/
 build/
+
+# --- Sello/firma personal: NUNCA subir al repositorio ---
+sello_firma*.png
+*sello*.png
+*firma*.png
+assets/private/
+*.vault
+session*.json
+.pytest_cache/

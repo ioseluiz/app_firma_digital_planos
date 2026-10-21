@@ -6,11 +6,13 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['bcrypt'],
+    hiddenimports=['bcrypt', 'cryptography', 'PyQt6.QtSvg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Extras de IA de PyMuPDF 2.x que la app no usa (ver app/__init__.py)
+    excludes=['pymupdf.layout', 'pymupdf_layout', 'pymupdf4llm', 'onnxruntime', 'networkx',
+              'tabulate', 'tkinter', 'pytest', 'tests', 'tools'],
     noarchive=False,
     optimize=0,
 )

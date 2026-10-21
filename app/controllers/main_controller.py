@@ -1,323 +1,997 @@
-from PyQt6.QtWidgets import (
-    QFileDialog,
-    QMessageBox,
-    QTableWidgetItem,
-    QInputDialog,
-    QLineEdit,
-    QStyle 
-)
-from PyQt6.QtGui import QIcon, QColor 
-from PyQt6.QtCore import Qt 
-
-from app.views.main_view import MainView
-from app.views.login_view import LoginView
-from app.views.selector_view import SelectorView
-from app.models.user_model import UserModel
-from app.utils.pdf_stamper import PDFStamper
+import json
 import os
-import shutil
+from dataclasses import replace
+
+import pymupdf
+from PyQt6.QtCore import QEvent, QObject, QTimer, QUrl
+from PyQt6.QtGui import QDesktopServices, QPixmap, QUndoCommand, QUndoStack
+from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QLineEdit, QMessageBox
+
+from app.models.placement import PROFILE_PLAN, Placement, SealJob, SealRuleError, parse_page_ranges
+from app.models.vault_model import VaultModel
+from app.utils import geometry, pdf_stamper, seal_id, stamp_image
+from app.utils.crypto_vault import VaultError
 from app.utils.paths import get_app_data_path
+from app.views import page_navigator as nav
+from app.views.login_view import SetupDialog, UnlockDialog
+from app.views.main_view import MainView
+from app.views.stamp_dialog import StampDialog
+from app.views.verify_view import VerifyDialog
+from app.workers.loader_worker import FileLoaderWorker, read_document
+from app.workers.render_worker import RenderWorker
 from app.workers.signing_worker import SigningWorker
-from app.workers.loader_worker import FileLoaderWorker  # Worker de carga
 
-class MainController:
+IDLE_LOCK_MINUTES = 15
+SESSION_FILE = "session.json"
+
+# Ids para fusionar comandos consecutivos de deshacer (p. ej. varios toques de flecha)
+MERGE_NUDGE, MERGE_SPIN, MERGE_WHEEL = 1, 2, 3
+
+
+class SetPlacementCommand(QUndoCommand):
+    """Cambia el sello de una o varias hojas. Base de todo deshacer/rehacer."""
+
+    def __init__(self, ctrl, changes, text, merge_id=-1):
+        super().__init__(text)
+        self.ctrl = ctrl
+        self.changes = changes          # [(key, before, after)]
+        self.merge_id = merge_id
+
+    def redo(self):
+        self.changes = [(k, b, self.ctrl.apply_placement(k, a)) for k, b, a in self.changes]
+        self.ctrl.after_command([k for k, _, _ in self.changes])
+
+    def undo(self):
+        for k, b, _a in reversed(self.changes):
+            self.ctrl.apply_placement(k, b)
+        self.ctrl.after_command([k for k, _, _ in self.changes])
+
+    def id(self):
+        return self.merge_id
+
+    def mergeWith(self, other):
+        if len(self.changes) != 1 or len(other.changes) != 1 or self.changes[0][0] != other.changes[0][0]:
+            return False
+        k, b, _ = self.changes[0]
+        self.changes = [(k, b, other.changes[0][2])]
+        return True
+
+
+class StructureCommand(QUndoCommand):
+    """Borrar, insertar o reordenar hojas de un documento (guarda el estado completo antes/después)."""
+
+    def __init__(self, ctrl, path, before, after, text, focus_before, focus_after):
+        super().__init__(text)
+        self.ctrl, self.path = ctrl, path
+        self.before, self.after = before, after
+        self.focus_before, self.focus_after = focus_before, focus_after
+
+    def redo(self):
+        self.ctrl.apply_structure(self.path, self.after, self.focus_after)
+
+    def undo(self):
+        self.ctrl.apply_structure(self.path, self.before, self.focus_before)
+
+
+class MainController(QObject):
     def __init__(self):
-        self.user_model = UserModel()
-        self.login_view = None
-        self.main_view = None
-        self.current_user = None
-        self.worker = None        # Worker de firma
-        self.loader_worker = None # Worker de carga
+        super().__init__()
+        self.vault = VaultModel()
+        self.theme = self.vault.get_setting("theme", "light")
+        self.view = None
+        self.job = None
+        self.stamp = None               # (png, w_mm, h_mm)
+        self.current = None             # (path, page_index)
+        self.undo = QUndoStack(self)
+        self.render = None
+        self.loader = None
+        self.signer = None
+        self._render_token = 0
+        self._done_docs = {}            # path -> ruta de salida (sellado en esta sesión)
+        self._errors = {}               # (path, idx) -> mensaje
+        self._pending_pw = {}           # path -> owner password del lote en curso
+        self._restore_data = None
+        self._locked_ui = False
 
-        self.is_dark_mode = False
-        self.output_directory = None
-        self.custom_coords = None
+        self._idle = QTimer(self)
+        self._idle.setInterval(IDLE_LOCK_MINUTES * 60 * 1000)
+        self._idle.setSingleShot(True)
+        self._idle.timeout.connect(lambda: self.lock_now(idle=True))
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(1500)
+        self._save_timer.timeout.connect(self.save_session)
 
+    # ======================================================================
+    # Arranque y bóveda
+    # ======================================================================
     def start(self):
-        self.login_view = LoginView()
-        self.login_view.btn_login.clicked.connect(self.handle_login)
-        self.login_view.exec()
+        """Devuelve False si el usuario cancela el acceso."""
+        if not self.vault.is_initialized():
+            dlg = SetupDialog(self.theme)
+            if not dlg.exec():
+                return False
+            name, password = dlg.values()
+            self.vault.setup(password)
+            self.vault.set_setting("owner_name", name)
+        elif not self._ask_unlock():
+            return False
 
-    def handle_login(self):
-        username, password = self.login_view.get_credentials()
-        user = self.user_model.authenticate(username, password)
+        self._migrate_legacy()
+        self.show_main_window()
+        self._load_stamp()
+        if self.stamp is None:
+            QMessageBox.information(self.view, "Configura tu sello",
+                                    "Antes de sellar, importa el escaneo de tu sello con firma.")
+            self.open_stamp_dialog()
+        self._offer_session_restore()
+        return True
 
-        if user:
-            self.current_user = user
-            self.login_view.accept()
-            self.show_main_window()
+    def _ask_unlock(self, reason=""):
+        dlg = UnlockDialog(self.theme, reason, self.view if self.view and self.view.isVisible() else None)
+        failures = {"n": 0}
+
+        def attempt():
+            if self.vault.unlock(dlg.password()):
+                dlg.accept()
+                return
+            failures["n"] += 1
+            delay = min(30, 2 ** (failures["n"] - 1))
+            dlg.show_error(f"Contraseña incorrecta. Espera {delay} s para reintentar.")
+            dlg.clear()
+            dlg.btn_ok.setEnabled(False)
+            QTimer.singleShot(delay * 1000, lambda: dlg.btn_ok.setEnabled(True))
+
+        dlg.btn_ok.clicked.connect(attempt)
+        return bool(dlg.exec())
+
+    def _migrate_legacy(self):
+        """Firmas de la versión multiusuario guardadas en claro → bóveda cifrada."""
+        paths = self.vault.legacy_signature_paths()
+        if not paths:
+            if self.vault.db.has_legacy_users():
+                self.vault.drop_legacy_users()
+            return
+        if self.vault.load_stamp() is None:
+            answer = QMessageBox.question(
+                None, "Firma de la versión anterior",
+                "Se encontró una imagen de firma de la versión anterior guardada SIN cifrar:\n\n"
+                f"{paths[0]}\n\n¿Importarla a la bóveda cifrada? (luego podrás ajustar su tamaño real)")
+            if answer == QMessageBox.StandardButton.Yes:
+                with open(paths[0], "rb") as f:
+                    data = f.read()
+                img = stamp_image.from_bytes(data)
+                w_mm, h_mm = stamp_image.physical_size_mm(img.width, img.height, stamp_image.image_dpi(img))
+                self.vault.save_stamp(stamp_image.to_png_bytes(img.convert("RGBA")), w_mm, h_mm, False)
+        answer = QMessageBox.question(
+            None, "Borrar copias sin cifrar",
+            "¿Borrar las copias sin cifrar de firmas de la versión anterior?\n\n" + "\n".join(paths))
+        if answer == QMessageBox.StandardButton.Yes:
+            for p in paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        self.vault.drop_legacy_users()
+
+    def _load_stamp(self):
+        self.stamp = self.vault.load_stamp()
+        confirmed = self.vault.get_setting("stamp_size_confirmed", False)
+        if self.stamp is None:
+            self.view.properties.set_stamp_info(None, 0, 0, False)
+            self._update_seal_button()
+            return
+        png, w_mm, h_mm = self.stamp
+        bw_mm, bh_mm = pdf_stamper.block_size_mm(w_mm, h_mm)
+        if self.job is None:
+            self.job = SealJob(geometry.mm_to_pt(bw_mm), geometry.mm_to_pt(bh_mm))
         else:
-            self.login_view.show_error("Usuario o contraseña incorrectos")
+            self.job.set_stamp_size(geometry.mm_to_pt(bw_mm), geometry.mm_to_pt(bh_mm))
+        pm = QPixmap()
+        pm.loadFromData(png)
+        self.view.canvas.set_stamp_spec(pm, geometry.mm_to_pt(w_mm), geometry.mm_to_pt(h_mm),
+                                        geometry.mm_to_pt(pdf_stamper.ID_STRIP_MM))
+        self.view.properties.set_stamp_info(png, w_mm, h_mm, confirmed)
+        self.refresh_all()
 
+    # ======================================================================
+    # Ventana principal
+    # ======================================================================
     def show_main_window(self):
-        self.main_view = MainView(self.current_user)
+        v = self.view = MainView(self.vault.get_setting("owner_name", ""), self.theme)
+        if self.job is None:
+            self.job = SealJob(1, 1)   # se redimensiona al cargar el sello
 
-        self.main_view.btn_logout.clicked.connect(self.logout)
-        self.main_view.btn_toggle_theme.clicked.connect(self.toggle_theme)
+        self.render = RenderWorker()
+        self.render.page_rendered.connect(self._on_page_rendered)
+        self.render.thumb_rendered.connect(v.navigator.set_thumbnail)
+        self.render.start()
 
-        # Pestaña Firma
-        self.main_view.btn_add_files.clicked.connect(self.select_files)
-        self.main_view.btn_clear.clicked.connect(self.main_view.list_files.clear)
-        self.main_view.btn_select_output.clicked.connect(self.select_output_folder)
-        self.main_view.btn_set_coords.clicked.connect(self.open_coordinate_selector)
-        self.main_view.btn_process.clicked.connect(self.process_signing)
-        
-        # Doble clic para editar posición individual
-        self.main_view.list_files.itemDoubleClicked.connect(self.edit_single_file_position)
+        v.act_open.triggered.connect(self.select_files)
+        v.act_clear.triggered.connect(self.clear_all)
+        v.act_stamp.triggered.connect(self.open_stamp_dialog)
+        v.act_verify.triggered.connect(self.open_verify)
+        v.act_undo.triggered.connect(self.undo.undo)
+        v.act_redo.triggered.connect(self.undo.redo)
+        self.undo.canUndoChanged.connect(v.act_undo.setEnabled)
+        self.undo.canRedoChanged.connect(v.act_redo.setEnabled)
+        v.act_undo.setEnabled(False)
+        v.act_redo.setEnabled(False)
+        v.act_zoom_in.triggered.connect(lambda: v.canvas.zoom_by(1.25))
+        v.act_zoom_out.triggered.connect(lambda: v.canvas.zoom_by(0.8))
+        v.act_fit.triggered.connect(v.canvas.fit_page)
+        v.act_prev.triggered.connect(lambda: self.go_relative(-1))
+        v.act_next.triggered.connect(lambda: self.go_relative(1))
+        v.act_theme.triggered.connect(self.toggle_theme)
+        v.act_lock.triggered.connect(self.lock_now)
+        v.btn_seal.clicked.connect(self.start_sealing)
+        v.btn_cancel.clicked.connect(self.cancel_sealing)
+        v.closing.connect(self.shutdown)
 
-        # CONEXIÓN DROP: Cuando la vista recibe archivos, llamamos a la carga asíncrona
-        self.main_view.files_dropped.connect(self.load_files_async)
+        n = v.navigator
+        n.page_selected.connect(self.show_page)
+        n.files_dropped.connect(self.load_files)
+        n.profile_change_requested.connect(self.change_profile)
+        n.seal_all_requested.connect(self.seal_all_pages)
+        n.clear_all_requested.connect(self.clear_file_seals)
+        n.remove_file_requested.connect(self.remove_file)
+        n.delete_pages_requested.connect(self.delete_pages)
+        n.insert_pages_requested.connect(self.insert_pages)
+        n.move_page_requested.connect(self.move_page)
 
-        # Pestaña Configuración
-        if hasattr(self.main_view, "btn_upload_sig"):
-            self.main_view.btn_upload_sig.clicked.connect(self.upload_signature)
-            existing_sig = self.current_user.get("signature_path")
-            if existing_sig:
-                self.main_view.set_signature_image(existing_sig)
+        c = v.canvas
+        c.files_dropped.connect(self.load_files)
+        c.stamp_live.connect(v.properties.show_live)
+        c.stamp_committed.connect(lambda x, y, r: self.edit_current(
+            lambda pl: Placement(x, y, r, True), "Mover/rotar sello"))
+        c.place_requested.connect(self.place_at)
+        c.remove_requested.connect(self.remove_current)
+        c.nudge_requested.connect(lambda dx, dy: self.edit_current(
+            lambda pl: Placement(pl.cx + dx, pl.cy + dy, pl.rotation, True), "Mover sello", MERGE_NUDGE))
+        c.rotate_by_requested.connect(self.rotate_by)
+        c.render_requested.connect(self._request_render)
 
-        # Pestaña Admin
-        if self.current_user["role"] == "admin":
-            self.main_view.btn_create_user.clicked.connect(self.create_user)
-            self.main_view.btn_delete_user.clicked.connect(self.delete_user)
-            self.main_view.btn_reset_pass.clicked.connect(self.reset_user_password)
-            self.load_user_list()
+        p = v.properties
+        p.place_clicked.connect(self.place_default)
+        p.remove_clicked.connect(self.remove_current)
+        p.reset_clicked.connect(self.reset_current)
+        p.rotate_by_clicked.connect(self.rotate_by)
+        p.values_edited.connect(lambda x, y, r: self.edit_current(
+            lambda pl: Placement(x, y, r, True), "Editar posición", MERGE_SPIN))
+        p.copy_selected_clicked.connect(lambda: self.copy_current_to(v.navigator.selected_pages(),
+                                                                     "las hojas seleccionadas"))
+        p.copy_file_clicked.connect(lambda: self.copy_current_to(
+            [(self.current[0], pg.index) for pg in self.job.documents[self.current[0]].pages],
+            "todas las hojas del archivo"))
+        p.copy_all_clicked.connect(lambda: self.copy_current_to(
+            [(d.path, pg.index) for d in self.job.documents.values() for pg in d.pages],
+            "todas las hojas de todos los archivos"))
+        p.profile_changed.connect(lambda prof: self.current and self.change_profile(self.current[0], prof))
+        p.project_changed.connect(self._save_project)
+        p.output_dir_clicked.connect(self.select_output_folder)
+        p.output_dir_reset_clicked.connect(lambda: self._set_output_dir(None))
+        p.stamp_settings_clicked.connect(self.open_stamp_dialog)
+        p.set_project(self.vault.get_setting("project", ""), self.vault.get_setting("expediente", ""))
+        out = self.vault.get_setting("output_dir")
+        p.set_output_dir(out if out and os.path.isdir(out) else None)
 
-        self.main_view.show()
+        QApplication.instance().installEventFilter(self)
+        self._idle.start()
+        self._update_seal_button()
+        v.show()
 
-    def logout(self):
-        self.main_view.close()
-        self.current_user = None
-        self.start()
+    def shutdown(self):
+        self.save_session()
+        if self.signer and self.signer.isRunning():
+            self.signer.cancel()
+            self.signer.wait(5000)
+        if self.render:
+            self.render.stop()
+        QApplication.instance().removeEventFilter(self)
+        QApplication.instance().quit()
 
     def toggle_theme(self):
-        if self.is_dark_mode:
-            self.main_view.set_theme("light")
-            self.is_dark_mode = False
-        else:
-            self.main_view.set_theme("dark")
-            self.is_dark_mode = True
+        self.theme = "dark" if self.theme == "light" else "light"
+        self.vault.set_setting("theme", self.theme)
+        self.view.set_theme(self.theme)
+        self.refresh_all()
 
-    # --------------------------------------------------------------------------
-    # LÓGICA DE CARGA DE ARCHIVOS (ASÍNCRONA)
-    # --------------------------------------------------------------------------
-    def select_files(self):
-        """Botón 'Seleccionar PDFs'"""
-        files, _ = QFileDialog.getOpenFileNames(
-            self.main_view, "Seleccionar Planos", "", "PDF Files (*.pdf)"
-        )
-        if files:
-            self.load_files_async(files)
+    # ======================================================================
+    # Bloqueo por inactividad
+    # ======================================================================
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress, QEvent.Type.Wheel,
+                            QEvent.Type.MouseMove):
+            if not self._locked_ui:
+                self._idle.start()
+        return False
 
-    def load_files_async(self, raw_paths):
-        """Inicia el hilo de carga para evitar congelamiento"""
-        if not raw_paths: return
-
-        # Bloquear UI y mostrar progreso
-        self.main_view.btn_process.setEnabled(False)
-        self.main_view.progress_bar.setVisible(True)
-        self.main_view.progress_bar.setValue(0)
-        self.main_view.lbl_process_status.setText(f"Analizando {len(raw_paths)} archivos...")
-
-        # Configurar y arrancar worker
-        self.loader_worker = FileLoaderWorker(raw_paths)
-        self.loader_worker.progress_updated.connect(self.main_view.progress_bar.setValue)
-        self.loader_worker.finished_signal.connect(self.on_files_loaded)
-        self.loader_worker.start()
-
-    def on_files_loaded(self, valid_pdfs):
-        """Callback al terminar la carga"""
-        if valid_pdfs:
-            # addItems es mucho más rápido que un bucle
-            self.main_view.list_files.addItems(valid_pdfs)
-            self.main_view.lbl_process_status.setText(f"Listo: {len(valid_pdfs)} nuevos archivos cargados.")
-        else:
-            self.main_view.lbl_process_status.setText("No se encontraron archivos PDF válidos.")
-
-        # Restaurar UI
-        self.main_view.progress_bar.setVisible(False)
-        self.main_view.btn_process.setEnabled(True)
-        self.loader_worker = None
-
-    # --------------------------------------------------------------------------
-    # OTRAS FUNCIONES (SELECCIÓN, EDICIÓN, FIRMA)
-    # --------------------------------------------------------------------------
-    def select_output_folder(self):
-        folder = QFileDialog.getExistingDirectory(self.main_view, "Seleccionar Carpeta de Destino")
-        if folder:
-            self.output_directory = folder
-            self.main_view.lbl_output_dir.setText(f"Destino: {folder}")
-            self.main_view.lbl_output_dir.setStyleSheet("color: #00aaff; font-weight: bold; font-size: 11px;")
-
-    def open_coordinate_selector(self):
-        if self.main_view.list_files.count() == 0:
-            QMessageBox.warning(self.main_view, "Atención", "Primero agrega archivos PDF.")
+    def lock_now(self, idle=False):
+        if self._locked_ui or self.view is None:
             return
-        ref_pdf_path = self.main_view.list_files.item(0).text()
-        selector = SelectorView(ref_pdf_path)
-        if selector.exec():
-            geometry = selector.get_geometry()
-            if geometry:
-                self.custom_coords = geometry
-                x, y, w, h = geometry
-                self.main_view.lbl_coords_status.setText(f"Posición Global: X={int(x)}, Y={int(y)}")
-                self.main_view.lbl_coords_status.setStyleSheet("color: #00aaff; font-weight: bold;")
-            else:
-                self.custom_coords = None
-                self.main_view.lbl_coords_status.setText("Posición: Predeterminada")
-                self.main_view.lbl_coords_status.setStyleSheet("color: #888;")
+        if self.signer and self.signer.isRunning():
+            self._idle.start()   # no bloquear a mitad de un sellado
+            return
+        self._locked_ui = True
+        self.save_session()
+        self.vault.lock()
+        self.stamp = None
+        self.view.hide()
+        reason = (f"La aplicación se bloqueó tras {IDLE_LOCK_MINUTES} minutos sin actividad."
+                  if idle else "Aplicación bloqueada.")
+        if self._ask_unlock(reason):
+            self._locked_ui = False
+            self.view.show()
+            self._load_stamp()
+            self._idle.start()
+        else:
+            self.view.close()
 
-    def edit_single_file_position(self, item):
-        pdf_path = item.data(Qt.ItemDataRole.UserRole + 1)
-        if not pdf_path: pdf_path = item.text()
-        
-        current_coords = item.data(Qt.ItemDataRole.UserRole)
-        if not current_coords: current_coords = self.custom_coords
-        if not current_coords: current_coords = (400, 700, 150, 60)
-        
-        selector = SelectorView(pdf_path, initial_coords=current_coords)
-        if selector.exec():
-            new_coords = selector.get_geometry()
-            if new_coords:
-                item.setData(Qt.ItemDataRole.UserRole, new_coords)
-                base_name = os.path.basename(pdf_path)
-                item.setText(f"{base_name} (Posición Personalizada ✏️)")
-                item.setToolTip(f"Coordenadas personalizadas: {new_coords}")
-                item.setData(Qt.ItemDataRole.UserRole + 1, pdf_path) 
-                item.setIcon(QIcon())
-                item.setBackground(QColor(0,0,0,0))
+    # ======================================================================
+    # Carga de archivos
+    # ======================================================================
+    def select_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self.view, "Abrir planos o reportes", "", "PDF (*.pdf)")
+        if files:
+            self.load_files(files)
 
-    def upload_signature(self):
-        file, _ = QFileDialog.getOpenFileName(self.main_view, "Seleccionar Firma", "", "Images (*.png *.jpg *.jpeg)")
-        if file:
-            app_data = get_app_data_path()
-            sig_folder = os.path.join(app_data, "signatures")
-            if not os.path.exists(sig_folder): os.makedirs(sig_folder)
-            
-            file_ext = os.path.splitext(file)[1]
-            new_filename = f"sig_user_{self.current_user['id']}{file_ext}"
-            destination = os.path.join(sig_folder, new_filename)
+    def load_files(self, paths):
+        if not paths or (self.loader and self.loader.isRunning()):
+            return
+        self.view.set_busy(True)
+        self.view.set_status("Leyendo archivos…")
+        self.loader = FileLoaderWorker(paths, self._sealed_index())
+        self.loader.progress_updated.connect(self.view.progress.setValue)
+        self.loader.finished_signal.connect(self._on_files_loaded)
+        self.loader.start()
+
+    def _on_files_loaded(self, docs, errors):
+        self.view.set_busy(False)
+        added = []
+        for doc in docs:
+            if self.job.add_document(doc):
+                added.append(doc)
+                self.view.navigator.add_document(doc)
+        if self._restore_data:
+            self._restore_structure(self._restore_data)
+            self.job.restore_placements(self._restore_data)
+            self._restore_data = None
+        self.refresh_all()
+        self._request_thumbs()
+        locked = sum(p.locked for d in added for p in d.pages)
+        msg = f"{len(added)} archivo{'s' if len(added) != 1 else ''} cargado{'s' if len(added) != 1 else ''}"
+        if locked:
+            msg += f" · {locked} hoja{'s' if locked != 1 else ''} ya sellada{'s' if locked != 1 else ''} (bloqueadas)"
+        self.view.set_status(msg)
+        if added and self.current is None:
+            first = added[0]
+            target = next((p.index for p in first.pages if self.job.placement(first.path, p.index)), 0)
+            self.view.navigator.select_page(first.path, target)
+        if errors:
+            QMessageBox.warning(self.view, "Algunos archivos no se cargaron",
+                                "\n".join(f"• {os.path.basename(p)}: {e}" for p, e in errors))
+        self._schedule_save()
+
+    def remove_file(self, path):
+        self.job.remove_document(path)
+        self.view.navigator.remove_document(path)
+        self.render.forget(path)
+        self._done_docs.pop(path, None)
+        self.undo.clear()   # los comandos guardados podrían referirse a ese archivo
+        if self.current and self.current[0] == path:
+            self.current = None
+            self.view.canvas.show_page(None, None, False)
+            self.view.properties.show_page(None, None, None, False)
+            order = self.view.navigator.page_order()
+            if order:
+                self.view.navigator.select_page(*order[0])
+        self._update_seal_button()
+        self._schedule_save()
+
+    def clear_all(self):
+        if not self.job.documents:
+            return
+        if QMessageBox.question(self.view, "Limpiar", "¿Quitar todos los archivos de la lista?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        for path in list(self.job.documents):
+            self.render.forget(path)
+        self.job.clear()
+        self.view.navigator.clear_all()
+        self.undo.clear()
+        self._done_docs.clear()
+        self._errors.clear()
+        self.current = None
+        self.view.canvas.show_page(None, None, False)
+        self.view.properties.show_page(None, None, None, False)
+        self._update_seal_button()
+        self._schedule_save()
+
+    # ======================================================================
+    # Hoja actual
+    # ======================================================================
+    def _is_locked(self, key):
+        path, idx = key
+        return self.job.page(path, idx).locked or path in self._done_docs
+
+    def _banner(self, key):
+        path, idx = key
+        if path in self._done_docs:
+            return f"Sellado en esta sesión → {os.path.basename(self._done_docs[path])}"
+        return None
+
+    def show_page(self, path, index):
+        if path not in self.job.documents:
+            return
+        self.current = (path, index)
+        doc = self.job.documents[path]
+        page = doc.pages[index]
+        placement = self.job.placement(path, index)
+        locked = self._is_locked(self.current)
+        self.view.canvas.show_page(page, placement, locked, self._banner(self.current))
+        self.view.properties.show_page(doc, page, placement, locked)
+        self._request_render(self.view.canvas.zoom_factor() * self.view.canvas.devicePixelRatioF())
+
+    def go_relative(self, step):
+        order = self.view.navigator.page_order()
+        if not order:
+            return
+        i = order.index(self.current) if self.current in order else -1
+        self.view.navigator.select_page(*order[max(0, min(len(order) - 1, i + step))])
+
+    def _request_render(self, scale):
+        if self.current is None:
+            return
+        path, idx = self.current
+        doc = self.job.documents[path]
+        src_path, src_index = doc.source(doc.pages[idx])   # la hoja puede venir de otro PDF
+        self._render_token += 1
+        self.render.request_page(self._render_token, src_path, src_index, scale)
+
+    def _on_page_rendered(self, token, _src_path, _src_index, scale, image):
+        if token == self._render_token and self.current is not None:
+            self.view.canvas.set_page_image(image, scale)
+
+    def _request_thumbs(self):
+        sources = [d.source(p) for d in self.job.documents.values() for p in d.pages]
+        missing = self.view.navigator.missing_thumbnails(sources)
+        if missing:
+            self.render.request_thumbs(missing)
+
+    def _sealed_index(self):
+        """sha256 → [hojas selladas] del registro, para detectar PDFs ya sellados."""
+        return {sha: self.vault.sealed_pages_by_hash(sha) for sha in self.vault.known_output_hashes()}
+
+    # ======================================================================
+    # Armar el documento final: borrar, insertar y reordenar hojas
+    # ======================================================================
+    def _structure_editable(self, path):
+        if path not in self.job.documents:
+            return False
+        if path in self._done_docs:
+            self.view.set_status("Este archivo ya se selló en esta sesión; no se puede modificar.")
+            return False
+        return True
+
+    def _push_structure(self, path, change, text, focus):
+        """Ejecuta `change()` sobre el modelo y lo registra como comando de deshacer."""
+        before = self.job.snapshot(path)
+        before_focus = self.current[1] if self.current and self.current[0] == path else 0
+        try:
+            change()
+        except SealRuleError as e:
+            self.job.restore(path, before)
+            QMessageBox.warning(self.view, "No permitido", str(e))
+            return
+        after = self.job.snapshot(path)
+        self.job.restore(path, before)
+        self.undo.push(StructureCommand(self, path, before, after, text, before_focus, focus))
+
+    def apply_structure(self, path, snap, focus):
+        """Aplica un estado de hojas (de un comando) y refresca la vista."""
+        if path not in self.job.documents:
+            return
+        self.job.restore(path, snap)
+        doc = self.job.documents[path]
+        for key in [k for k in self._errors if k[0] == path]:
+            del self._errors[key]
+        self.view.navigator.rebuild_document(doc)
+        for p in doc.pages:
+            self._refresh_page((path, p.index))
+        self._update_file_labels({path})
+        self._update_seal_button()
+        self._request_thumbs()
+        focus = max(0, min(focus, len(doc.pages) - 1))
+        self.current = None
+        self.view.navigator.select_page(path, focus)
+        self._schedule_save()
+
+    def delete_pages(self, path, indices):
+        if not self._structure_editable(path) or not indices:
+            return
+        n = len(indices)
+        self._push_structure(path, lambda: self.job.delete_pages(path, indices),
+                             f"Eliminar {n} hoja{'s' if n != 1 else ''}", min(indices))
+        self.view.set_status(f"{n} hoja{'s' if n != 1 else ''} eliminada{'s' if n != 1 else ''} "
+                             "del documento final (Ctrl+Z para deshacer). El PDF original no se modifica.")
+
+    def move_page(self, path, index, delta):
+        if not self._structure_editable(path):
+            return
+        doc = self.job.documents[path]
+        if not 0 <= index + delta < len(doc.pages):
+            return
+        self._push_structure(path, lambda: self.job.move_page(path, index, delta), "Mover hoja", index + delta)
+
+    def insert_pages(self, path, at):
+        if not self._structure_editable(path):
+            return
+        src, _ = QFileDialog.getOpenFileName(self.view, "Insertar hojas de otro PDF", os.path.dirname(path),
+                                             "PDF (*.pdf)")
+        if not src:
+            return
+        src = os.path.normpath(src)
+        try:
+            source_doc = read_document(src, lambda sha: self._sealed_index().get(sha, []))
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self.view, "No se pudo leer", f"{os.path.basename(src)}: {e}")
+            return
+        total = len(source_doc.pages)
+        indices = list(range(total))
+        if total > 1:
+            text, ok = QInputDialog.getText(
+                self.view, "Hojas a insertar",
+                f"{os.path.basename(src)} tiene {total} hojas.\n"
+                "¿Cuáles insertar? (ej.: 1-3, 5 · vacío = todas)", QLineEdit.EchoMode.Normal, "")
+            if not ok:
+                return
             try:
-                shutil.copy2(file, destination)
-            except Exception as e:
-                QMessageBox.critical(self.main_view, "Error", f"No se pudo guardar: {e}")
+                indices = parse_page_ranges(text, total)
+            except ValueError as e:
+                QMessageBox.warning(self.view, "Rango no válido", str(e))
+                return
+        new_pages = [replace(source_doc.pages[i], index=0, src_path=src, src_index=i) for i in indices]
+        n = len(new_pages)
+        self._push_structure(path, lambda: self.job.insert_pages(path, at, new_pages),
+                             f"Insertar {n} hoja{'s' if n != 1 else ''}", at)
+        locked = sum(p.locked for p in new_pages)
+        msg = f"{n} hoja{'s' if n != 1 else ''} insertada{'s' if n != 1 else ''} de {os.path.basename(src)}"
+        if locked:
+            msg += f" · {locked} ya venía{'n' if locked != 1 else ''} sellada{'s' if locked != 1 else ''} (bloqueada{'s' if locked != 1 else ''})"
+        self.view.set_status(msg)
+
+    def _restore_structure(self, data):
+        """Al restaurar la sesión, rehace las hojas borradas/insertadas/reordenadas."""
+        cache = {}
+        for d in data.get("documents", []):
+            spec, path = d.get("pages"), d.get("path")
+            if not spec or path not in self.job.documents:
+                continue
+            try:
+                pages = []
+                for i, (sp, si) in enumerate(spec):
+                    if sp not in cache:
+                        cache[sp] = (self.job.documents[sp] if sp in self.job.documents and sp == path
+                                     else read_document(sp, lambda sha: self._sealed_index().get(sha, [])))
+                    info = next(p for p in cache[sp].pages if cache[sp].source(p) == (sp, si))
+                    pages.append(replace(info, index=i, src_path=sp, src_index=si))
+            except Exception:  # noqa: BLE001 - si falta un origen, se deja el documento original
+                continue
+            self.job.restore(path, {"pages": pages, "placements": {}, "profile": d.get("profile", PROFILE_PLAN)})
+            self.view.navigator.rebuild_document(self.job.documents[path])
+
+    # ======================================================================
+    # Edición (todo pasa por comandos de deshacer)
+    # ======================================================================
+    def apply_placement(self, key, placement):
+        """Aplica al modelo y refresca la vista. Devuelve la colocación real (ajustada a la hoja)."""
+        path, idx = key
+        if path not in self.job.documents:
+            return placement
+        actual = self.job.set_placement(path, idx, placement)
+        self._refresh_page(key)
+        return actual
+
+    def after_command(self, keys):
+        """Tras hacer/deshacer: refrescar; si el cambio fue en UNA hoja distinta de la actual, ir a ella
+        (en cambios de varias hojas, como copiar, se queda en la hoja actual)."""
+        if len(keys) == 1 and self.current not in keys and keys[0][0] in self.job.documents:
+            self.view.navigator.select_page(*keys[0])
+        elif self.current in keys:
+            path, idx = self.current
+            pl = self.job.placement(path, idx)
+            self.view.canvas.update_placement(pl)
+            doc = self.job.documents[path]
+            self.view.properties.show_page(doc, doc.pages[idx], pl, self._is_locked(self.current))
+        self._update_file_labels({k[0] for k in keys})
+        self._update_seal_button()
+        self._schedule_save()
+
+    def _push(self, changes, text, merge_id=-1):
+        changes = [(k, b, a) for k, b, a in changes if b != a]
+        if not changes:
+            return
+        try:
+            self.undo.push(SetPlacementCommand(self, changes, text, merge_id))
+        except SealRuleError as e:
+            self.view.set_status(str(e))
+
+    def _editable_current(self):
+        if self.current is None or self._is_locked(self.current):
+            return None
+        return self.current
+
+    def edit_current(self, fn, text, merge_id=-1):
+        key = self._editable_current()
+        if key is None:
+            return
+        before = self.job.placement(*key)
+        if before is None:
+            return
+        self._push([(key, before, fn(before))], text, merge_id)
+
+    def place_at(self, x, y):
+        """Colocar el sello en (x, y). Si la hoja ya tiene sello, se MUEVE (nunca dos)."""
+        key = self._editable_current()
+        if key is None:
+            return
+        before = self.job.placement(*key)
+        rot = before.rotation if before else 0.0
+        self._push([(key, before, Placement(x, y, rot, True))],
+                   "Mover sello" if before else "Colocar sello")
+        self.view.canvas.select_stamp()
+
+    def place_default(self):
+        key = self._editable_current()
+        if key is None or self.job.placement(*key) is not None:
+            return
+        doc = self.job.documents[key[0]]
+        try:
+            pl = self.job.default_placement(doc.pages[key[1]], doc.profile)
+        except SealRuleError as e:
+            QMessageBox.warning(self.view, "No cabe", str(e))
+            return
+        self._push([(key, None, Placement(pl.cx, pl.cy, 0.0, True))], "Colocar sello")
+        self.view.canvas.select_stamp()
+
+    def remove_current(self):
+        key = self._editable_current()
+        if key and self.job.placement(*key) is not None:
+            self._push([(key, self.job.placement(*key), None)], "Quitar sello")
+
+    def reset_current(self):
+        key = self._editable_current()
+        if key is None:
+            return
+        doc = self.job.documents[key[0]]
+        try:
+            pl = self.job.default_placement(doc.pages[key[1]], doc.profile)
+        except SealRuleError as e:
+            QMessageBox.warning(self.view, "No cabe", str(e))
+            return
+        self._push([(key, self.job.placement(*key), pl)], "Restablecer sello")
+
+    def rotate_by(self, deg):
+        merge = MERGE_WHEEL if abs(deg) < 90 else -1
+        self.edit_current(lambda pl: Placement(pl.cx, pl.cy, pl.rotation + deg, True), "Rotar sello", merge)
+
+    def copy_current_to(self, targets, description):
+        key = self._editable_current()
+        if key is None or self.job.placement(*key) is None:
+            return
+        src = self.job.placement(*key)
+        changes, skipped = [], 0
+        for t in targets:
+            if t == key:
+                continue
+            if self._is_locked(t):
+                skipped += 1
+                continue
+            page = self.job.page(*t)
+            if not geometry.fits_on_page(self.job.stamp_w, self.job.stamp_h, src.rotation, page.width, page.height):
+                skipped += 1
+                continue
+            changes.append((t, self.job.placement(*t), Placement(src.cx, src.cy, src.rotation, True)))
+        if not changes:
+            self.view.set_status("No hay otras hojas a las que copiar.")
+            return
+        self._push(changes, f"Copiar sello a {description}")
+        msg = f"Posición copiada a {len(changes)} hoja{'s' if len(changes) != 1 else ''}"
+        if skipped:
+            msg += f" · {skipped} omitida{'s' if skipped != 1 else ''} (bloqueadas o el sello no cabe)"
+        self.view.set_status(msg)
+
+    def seal_all_pages(self, path):
+        doc = self.job.documents[path]
+        changes = []
+        for p in doc.pages:
+            key = (path, p.index)
+            if self._is_locked(key) or self.job.placement(*key) is not None:
+                continue
+            try:
+                changes.append((key, None, self.job.default_placement(p, PROFILE_PLAN)))
+            except SealRuleError:
+                pass
+        self._push(changes, "Poner sello en todas las hojas")
+
+    def clear_file_seals(self, path):
+        doc = self.job.documents[path]
+        changes = [((path, p.index), self.job.placement(path, p.index), None)
+                   for p in doc.pages if not self._is_locked((path, p.index))]
+        self._push(changes, "Quitar sellos del archivo")
+
+    def change_profile(self, path, profile):
+        doc = self.job.documents.get(path)
+        if doc is None or doc.profile == profile:
+            return
+        manual = any(pl.manual for pl in self.job.placements_for(path).values())
+        if manual and QMessageBox.question(
+                self.view, "Cambiar tipo de documento",
+                "Cambiar el tipo restablece las posiciones del sello en todas las hojas de este archivo "
+                "(podrás deshacerlo). ¿Continuar?") != QMessageBox.StandardButton.Yes:
+            self.view.properties.show_page(doc, doc.pages[self.current[1]] if self.current else None,
+                                           self.job.placement(*self.current) if self.current else None,
+                                           self._is_locked(self.current) if self.current else False)
+            return
+        # Calcular las posiciones del nuevo perfil y registrarlas como un comando (deshacer):
+        # se aplican, se anotan y se vuelve al estado previo para que el comando las re-aplique.
+        before = {p.index: self.job.placement(path, p.index) for p in doc.pages}
+        self.job.apply_profile(path, profile)
+        after = {p.index: self.job.placement(path, p.index) for p in doc.pages}
+        for idx, pl in before.items():
+            if pl is None:
+                self.job.remove(path, idx)
+            else:
+                self.job.set_placement(path, idx, pl)
+        self._push([((path, i), before[i], after[i]) for i in before], "Cambiar tipo de documento")
+        self._update_file_labels({path})
+
+    # ======================================================================
+    # Refresco de la vista
+    # ======================================================================
+    def _status_for(self, key):
+        path, idx = key
+        if key in self._errors:
+            return nav.STATUS_ERROR
+        if path in self._done_docs:
+            return nav.STATUS_DONE if self.job.placement(*key) else (
+                nav.STATUS_LOCKED if self.job.page(*key).locked else nav.STATUS_NONE)
+        if self.job.page(*key).locked:
+            return nav.STATUS_LOCKED
+        pl = self.job.placement(*key)
+        if pl is None:
+            return nav.STATUS_NONE
+        return nav.STATUS_MANUAL if pl.manual else nav.STATUS_PLACED
+
+    def _refresh_page(self, key):
+        self.view.navigator.set_page_status(*key, self._status_for(key), self._errors.get(key, ""))
+
+    def _update_file_labels(self, paths):
+        for path in paths:
+            doc = self.job.documents.get(path)
+            if doc:
+                self.view.navigator.update_file_label(doc, len(self.job.placements_for(path)))
+
+    def refresh_all(self):
+        if self.view is None or self.job is None:
+            return
+        for doc in self.job.documents.values():
+            for p in doc.pages:
+                self._refresh_page((doc.path, p.index))
+        self._update_file_labels(self.job.documents.keys())
+        self._update_seal_button()
+        if self.current and self.current[0] in self.job.documents:
+            self.show_page(*self.current)
+
+    def _pending_docs(self):
+        return [d for d in self.job.documents.values()
+                if d.path not in self._done_docs and self.job.placements_for(d.path)]
+
+    def _update_seal_button(self):
+        if self.view is None:
+            return
+        docs = self._pending_docs() if self.job else []
+        pages = sum(len(self.job.placements_for(d.path)) for d in docs)
+        self.view.set_seal_count(pages if self.stamp else 0, len(docs))
+
+    # ======================================================================
+    # Sello, proyecto y salida
+    # ======================================================================
+    def open_stamp_dialog(self):
+        dlg = StampDialog(self.vault, self.theme, self.view)
+        if dlg.exec():
+            self._load_stamp()
+            self.view.set_status("Sello actualizado.")
+
+    def _save_project(self, project, expediente):
+        self.vault.set_setting("project", project)
+        self.vault.set_setting("expediente", expediente)
+
+    def select_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self.view, "Carpeta de salida")
+        if folder:
+            self._set_output_dir(folder)
+
+    def _set_output_dir(self, folder):
+        self.vault.set_setting("output_dir", folder)
+        self.view.properties.set_output_dir(folder)
+
+    # ======================================================================
+    # Sellado
+    # ======================================================================
+    def start_sealing(self):
+        if self.stamp is None:
+            QMessageBox.warning(self.view, "Sin sello", "Configura tu sello antes de sellar.")
+            return
+        docs = self._pending_docs()
+        if not docs:
+            return
+        if not self.vault.get_setting("stamp_size_confirmed", False):
+            if QMessageBox.question(
+                    self.view, "Tamaño no confirmado",
+                    "Aún no confirmaste el tamaño real del sello midiéndolo con una regla.\n"
+                    "¿Sellar de todas formas?") != QMessageBox.StandardButton.Yes:
                 return
 
-            self.user_model.update_signature(self.current_user['id'], destination)
-            self.current_user['signature_path'] = destination
-            self.main_view.user_data['signature_path'] = destination
-            self.main_view.set_signature_image(destination)
-            QMessageBox.information(self.main_view, "Éxito", "Firma guardada correctamente.")
+        png, w_mm, h_mm = self.stamp
+        out_dir = self.vault.get_setting("output_dir")
+        out_dir = out_dir if out_dir and os.path.isdir(out_dir) else None
+        hmac_key = self.vault.hmac_key()
+        owner = self.vault.get_setting("owner_name", "")
+        project = self.vault.get_setting("project", "")
+        expediente = self.vault.get_setting("expediente", "")
+        jobs, taken = [], []
+        self._pending_pw.clear()
+        n_pages = 0
+        for d in docs:
+            placements = self.job.placements_for(d.path)
+            out = pdf_stamper.output_path_for(d.path, out_dir, taken)
+            taken.append(out)
+            pw = pdf_stamper.generate_owner_password()
+            self._pending_pw[d.path] = pw
+            n_pages += len(placements)
+            jobs.append({"key": d.path, "args": dict(
+                src_path=d.path, out_path=out,
+                placements=[(i, pl.cx, pl.cy, pl.rotation) for i, pl in sorted(placements.items())],
+                stamp_png=png, stamp_w_mm=w_mm, stamp_h_mm=h_mm, hmac_key=hmac_key, owner_pw=pw,
+                owner_name=owner, project=project, expediente=expediente,
+                pages_spec=d.page_sources() if d.is_modified() else None)})
 
-    def process_signing(self):
-        sig_path = self.current_user["signature_path"]
-        if not sig_path or not os.path.exists(sig_path):
-            QMessageBox.critical(self.main_view, "Error", "Archivo de firma no encontrado.")
+        dest = out_dir or "la misma carpeta de cada original"
+        if QMessageBox.question(
+                self.view, "Confirmar sellado",
+                f"Se sellarán {n_pages} hoja{'s' if n_pages != 1 else ''} en {len(jobs)} "
+                f"archivo{'s' if len(jobs) != 1 else ''}.\n\nDestino: {dest}\n"
+                "Los originales no se modifican. ¿Continuar?") != QMessageBox.StandardButton.Yes:
             return
 
-        count = self.main_view.list_files.count()
-        if count == 0:
-            QMessageBox.warning(self.main_view, "Atención", "No has seleccionado ningún archivo PDF.")
+        for d in docs:
+            for p in d.pages:
+                self._errors.pop((d.path, p.index), None)
+        self._results = []
+        self.view.set_busy(True, cancellable=True)
+        self.signer = SigningWorker(jobs)
+        self.signer.progress_updated.connect(self.view.progress.setValue)
+        self.signer.status_updated.connect(self.view.set_status)
+        self.signer.job_finished.connect(self._on_job_finished)
+        self.signer.finished_signal.connect(self._on_sealing_finished)
+        self.signer.start()
+
+    def cancel_sealing(self):
+        if self.signer and self.signer.isRunning():
+            self.signer.cancel()
+            self.view.set_status("Cancelando… (los archivos en curso terminarán)")
+
+    def _on_job_finished(self, result):
+        self._results.append(result)
+        path = result.get("key")
+        if path not in self.job.documents:
             return
-        
-        work_queue = []
-        for i in range(count):
-            item = self.main_view.list_files.item(i)
-            path = item.data(Qt.ItemDataRole.UserRole + 1)
-            if not path: path = item.text()
-            coords = item.data(Qt.ItemDataRole.UserRole)
-            if not coords: coords = self.custom_coords 
-            
-            # Limpiar estado visual previo
-            item.setIcon(QIcon())
-            item.setBackground(QColor(0,0,0,0))
-            if "Personalizada" not in item.text(): item.setToolTip("")
-            
-            work_queue.append({'path': path, 'coords': coords, 'list_index': i})
-
-        self.main_view.btn_process.setEnabled(False)
-        self.main_view.btn_clear.setEnabled(False)
-        self.main_view.progress_bar.setVisible(True)
-        self.main_view.progress_bar.setValue(0)
-        self.main_view.lbl_process_status.setText("Iniciando motor de firma...")
-
-        self.worker = SigningWorker(work_queue, sig_path, self.output_directory)
-        self.worker.progress_updated.connect(self.update_progress)
-        self.worker.status_updated.connect(self.update_status_label)
-        self.worker.finished_signal.connect(self.on_signing_finished)
-        self.worker.file_processed.connect(self.on_file_processed)
-        self.worker.start()
-
-    def update_progress(self, val):
-        self.main_view.progress_bar.setValue(val)
-
-    def update_status_label(self, text):
-        self.main_view.lbl_process_status.setText(text)
-    
-    def on_file_processed(self, index, success, msg):
-        item = self.main_view.list_files.item(index)
-        if success:
-            icon = self.main_view.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
-            item.setIcon(icon)
-            tooltip_prev = item.toolTip()
-            item.setToolTip(f"✅ Firmado correctamente. {tooltip_prev}")
+        if result["ok"]:
+            self.vault.log_seal(result, self._pending_pw.pop(path, ""))
+            self._done_docs[path] = result["out"]
         else:
-            icon = self.main_view.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxCritical)
-            item.setIcon(icon)
-            bg_color = QColor("#500000") if self.is_dark_mode else QColor("#ffcccc")
-            item.setBackground(bg_color)
-            item.setToolTip(f"❌ ERROR: {msg}")
+            for idx in self.job.placements_for(path):
+                self._errors[(path, idx)] = result.get("msg", "Error")
+        for p in self.job.documents[path].pages:
+            self._refresh_page((path, p.index))
+        if self.current and self.current[0] == path:
+            self.show_page(*self.current)
 
-    def on_signing_finished(self, report_msg):
-        self.main_view.btn_process.setEnabled(True)
-        self.main_view.btn_clear.setEnabled(True)
-        self.main_view.lbl_process_status.setText("Proceso finalizado")
-        self.main_view.progress_bar.setVisible(False)
-        QMessageBox.information(self.main_view, "Reporte Final", report_msg)
-        self.worker = None
+    def _on_sealing_finished(self, ok, failed, cancelled):
+        self.view.set_busy(False)
+        self._pending_pw.clear()
+        self._update_seal_button()
+        self.view.set_status(f"Sellado terminado: {ok} correcto{'s' if ok != 1 else ''}, "
+                             f"{failed} con error" + (" (cancelado)" if cancelled else ""))
+        lines = [f"Correctos: {ok}", f"Con error: {failed}"]
+        if cancelled:
+            lines.append("El proceso se canceló; algunos archivos no se sellaron.")
+        errors = [r for r in self._results if not r["ok"]]
+        if errors:
+            lines.append("")
+            lines += [f"• {os.path.basename(r.get('src') or '?')}: {r.get('msg')}" for r in errors[:10]]
+        box = QMessageBox(self.view)
+        box.setWindowTitle("Resultado del sellado")
+        box.setIcon(QMessageBox.Icon.Warning if failed else QMessageBox.Icon.Information)
+        box.setText("\n".join(lines))
+        open_btn = None
+        outs = [r["out"] for r in self._results if r["ok"]]
+        if outs:
+            open_btn = box.addButton("Abrir carpeta", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if open_btn is not None and box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(outs[0])))
+        self.signer = None
 
-    # --- CRUD USUARIOS ---
-    def load_user_list(self):
-        users = self.user_model.get_all_users()
-        self.main_view.table_users.setRowCount(0)
-        for row_idx, user_data in enumerate(users):
-            self.main_view.table_users.insertRow(row_idx)
-            self.main_view.table_users.setItem(row_idx, 0, QTableWidgetItem(str(user_data[0])))
-            self.main_view.table_users.setItem(row_idx, 1, QTableWidgetItem(str(user_data[1])))
-            self.main_view.table_users.setItem(row_idx, 2, QTableWidgetItem(str(user_data[2])))
+    # ======================================================================
+    # Verificación
+    # ======================================================================
+    def verify_document(self, path):
+        try:
+            sha = seal_id.sha256_file(path)
+        except OSError as e:
+            return "error", "No se pudo leer el archivo", str(e)
+        rows = self.vault.find_by_hash(sha)
+        if rows:
+            r = rows[0]
+            pages = ", ".join(str(x["page_index"] + 1) for x in rows)
+            ids = ", ".join(x["page_id"] for x in rows)
+            return ("ok", "✔ Emitido por ti y sin modificar",
+                    f"Sellado el {r['seal_date']} · documento {r['doc_id']}\n"
+                    f"Hojas selladas: {pages}\nIDs: {ids}\nOriginal: {os.path.basename(r['src_path'])}")
+        try:
+            with pymupdf.open(path) as doc:
+                marker = seal_id.parse_keywords((doc.metadata or {}).get("keywords", ""))
+        except Exception as e:  # noqa: BLE001
+            return "error", "No es un PDF válido", str(e)
+        if marker:
+            rows = self.vault.find_by_doc_id(marker[0])
+            if rows:
+                return ("modified", "⚠ Emitido por ti, pero MODIFICADO después",
+                        f"El documento {marker[0]} se selló el {rows[0]['seal_date']}, pero su contenido "
+                        "ya no coincide con el que emitiste (el hash es distinto).")
+            return ("unknown", "✖ ID de sellado desconocido",
+                    f"El PDF dice estar sellado con DigitalSealer (ID {marker[0]}), pero ese ID no está en "
+                    "tu registro: no lo emitiste desde esta instalación.")
+        return "unknown", "✖ No reconocido", "Este PDF no fue sellado por ti con esta aplicación."
 
-    def create_user(self):
-        u = self.main_view.txt_new_user.text()
-        p = self.main_view.txt_new_pass.text()
-        r = self.main_view.cmb_role.currentText()
-        if u and p:
-            if self.user_model.create_user(u, p, r):
-                QMessageBox.information(self.main_view, "Éxito", f"Usuario '{u}' creado.")
-                self.main_view.txt_new_user.clear()
-                self.main_view.txt_new_pass.clear()
-                self.load_user_list()
-            else:
-                QMessageBox.warning(self.main_view, "Error", "No se pudo crear.")
-        else:
-            QMessageBox.warning(self.main_view, "Error", "Datos incompletos.")
+    def open_verify(self):
+        VerifyDialog(self.verify_document, self.theme, self.view).exec()
 
-    def delete_user(self):
-        selected_rows = self.main_view.table_users.selectionModel().selectedRows()
-        if not selected_rows: return
-        row = selected_rows[0].row()
-        user_id = int(self.main_view.table_users.item(row, 0).text())
-        if user_id == self.current_user["id"]:
-            QMessageBox.critical(self.main_view, "Error", "No puedes eliminar tu cuenta.")
+    # ======================================================================
+    # Sesión
+    # ======================================================================
+    def _session_path(self):
+        return os.path.join(get_app_data_path(), SESSION_FILE)
+
+    def _schedule_save(self):
+        self._save_timer.start()
+
+    def save_session(self):
+        if self.job is None:
             return
-        if self.user_model.delete_user(user_id):
-            self.load_user_list()
-            QMessageBox.information(self.main_view, "Éxito", "Usuario eliminado.")
+        data = self.job.to_dict()
+        data["documents"] = [d for d in data["documents"] if d["path"] not in self._done_docs]
+        try:
+            with open(self._session_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
 
-    def reset_user_password(self):
-        selected_rows = self.main_view.table_users.selectionModel().selectedRows()
-        if not selected_rows: return
-        row = selected_rows[0].row()
-        user_id = int(self.main_view.table_users.item(row, 0).text())
-        new_pass, ok = QInputDialog.getText(self.main_view, "Reset", "Nueva contraseña:", QLineEdit.EchoMode.Normal)
-        if ok and new_pass:
-            if self.user_model.reset_password(user_id, new_pass):
-                QMessageBox.information(self.main_view, "Éxito", "Contraseña actualizada.")
+    def _offer_session_restore(self):
+        try:
+            with open(self._session_path(), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        paths = [d["path"] for d in data.get("documents", []) if os.path.isfile(d.get("path", ""))]
+        if not paths:
+            return
+        if QMessageBox.question(
+                self.view, "Restaurar sesión",
+                f"¿Reabrir los {len(paths)} archivo{'s' if len(paths) != 1 else ''} de la sesión anterior "
+                "con las posiciones del sello?") == QMessageBox.StandardButton.Yes:
+            self._restore_data = data
+            self.load_files(paths)
