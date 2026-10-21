@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app import __version__
 from app.utils import geometry
 from app.views.icons import icon
 from app.views.page_canvas import PageCanvas
@@ -19,7 +20,7 @@ class MainView(QMainWindow):
 
     def __init__(self, owner_name, theme="light"):
         super().__init__()
-        self.setWindowTitle(f"DigitalSealer · {owner_name}")
+        self.setWindowTitle(f"DigitalSealer {__version__} · {owner_name}")
         self.resize(1440, 900)
         self.setMinimumSize(1000, 640)
         self.theme = theme

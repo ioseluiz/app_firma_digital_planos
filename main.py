@@ -51,6 +51,10 @@ def selftest():
 
 
 def main():
+    if "--version" in sys.argv:
+        from app import __version__
+        print(__version__)
+        sys.exit(0)
     if "--selftest" in sys.argv:
         import os
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -62,6 +66,8 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("DigitalSealer")
+    from app import __version__
+    app.setApplicationVersion(__version__)
     # La ventana principal se oculta al bloquear; la app termina solo al cerrarla
     app.setQuitOnLastWindowClosed(False)
 

@@ -1,0 +1,70 @@
+name: Release
+
+# Al publicar un tag vX.Y.Z: pruebas → DigitalSealer.exe → autoprueba del .exe → release en GitHub.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag existente a publicar (p. ej. v2.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Instalar dependencias
+        run: pip install -r requirements-dev.txt
+
+      - name: Comprobar que el tag coincide con la versión de la app
+        shell: bash
+        run: |
+          version=$(python main.py --version)
+          if [ "v$version" != "$TAG" ]; then
+            echo "El tag $TAG no coincide con app.__version__ ($version)"; exit 1
+          fi
+
+      - name: Pruebas
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Construir ejecutable
+        run: pyinstaller --noconfirm DigitalSealer.spec
+
+      - name: Autoprueba del ejecutable
+        shell: bash
+        run: ./dist/DigitalSealer.exe --selftest
+
+      - name: Preparar archivos
+        shell: bash
+        run: |
+          mkdir release
+          cp dist/DigitalSealer.exe "release/DigitalSealer-$TAG-windows.exe"
+          cd release && sha256sum *.exe > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Publicar release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=".github/release-notes/$TAG.md"
+          [ -f "$notes" ] || notes=/dev/null
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* --title "DigitalSealer $TAG" --notes-file "$notes"
+          fi
