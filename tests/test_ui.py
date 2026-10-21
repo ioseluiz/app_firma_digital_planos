@@ -34,6 +34,9 @@ def ctrl(qtbot, tmp_path, monkeypatch, stamp_png):
     c._load_stamp()
     qtbot.addWidget(c.view)
     yield c
+    # Detener el autoguardado antes de que monkeypatch restaure la ruta real de AppData
+    c._save_timer.stop()
+    c._idle.stop()
     c.render.stop()
 
 
