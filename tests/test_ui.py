@@ -145,3 +145,69 @@ def test_theme_toggle_and_lock_state(qtbot, ctrl):
     assert ctrl.view.theme == "dark"
     ctrl.toggle_theme()
     assert ctrl.view.theme == "light"
+
+
+def test_assemble_document(qtbot, ctrl, tmp_path, monkeypatch):
+    """Borrar hojas, insertar hojas de otro PDF, reordenar, deshacer y sellar el documento armado."""
+    from PyQt6.QtWidgets import QFileDialog, QInputDialog
+
+    plan = make_pdf(str(tmp_path / "plano.pdf"), [ANSI_D] * 3)
+    anexo = make_pdf(str(tmp_path / "anexo.pdf"), [LETTER] * 4)
+    load(qtbot, ctrl, [plan])
+    job = ctrl.job
+    doc = job.documents[plan]
+
+    # Eliminar la hoja 2 (índice 1)
+    ctrl.delete_pages(plan, [1])
+    assert doc.page_sources() == [(plan, 0), (plan, 2)]
+    assert ctrl.view.navigator.page_order() == [(plan, 0), (plan, 1)]
+
+    # Insertar hojas 2 y 4 del anexo al final
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (anexo, "PDF (*.pdf)"))
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("2, 4", True))
+    ctrl.insert_pages(plan, 2)
+    assert doc.page_sources() == [(plan, 0), (plan, 2), (anexo, 1), (anexo, 3)]
+    assert job.placement(plan, 2) is not None          # plano: las hojas nuevas reciben sello
+    assert ctrl.current == (plan, 2)                  # se muestra la primera hoja insertada
+
+    # Mover la última hoja al principio (Alt+↑ tres veces)
+    for i in (3, 2, 1):
+        ctrl.move_page(plan, i, -1)
+    assert doc.page_sources()[0] == (anexo, 3)
+
+    # Deshacer los 3 movimientos y rehacer uno
+    for _ in range(3):
+        ctrl.undo.undo()
+    assert doc.page_sources() == [(plan, 0), (plan, 2), (anexo, 1), (anexo, 3)]
+    ctrl.undo.redo()
+    assert doc.page_sources() == [(plan, 0), (plan, 2), (anexo, 3), (anexo, 1)]
+
+    # No se puede dejar el documento sin hojas
+    ctrl.delete_pages(plan, [0, 1, 2, 3])
+    assert len(doc.pages) == 4
+
+    # Sesión: la estructura se guarda y se restaura
+    ctrl.save_session()
+    ctrl.job.clear()
+    ctrl.view.navigator.clear_all()
+    ctrl.current = None
+    ctrl._offer_session_restore()
+    qtbot.waitUntil(lambda: not ctrl.loader.isRunning() and bool(ctrl.job.documents), timeout=10000)
+    qtbot.wait(50)
+    doc = ctrl.job.documents[plan]
+    assert doc.page_sources() == [(plan, 0), (plan, 2), (anexo, 3), (anexo, 1)]
+
+    # Sellar: la salida es el documento armado
+    ctrl.start_sealing()
+    qtbot.waitUntil(lambda: ctrl.signer is None, timeout=60000)
+    assert all(r["ok"] for r in ctrl._results), ctrl._results
+    with pymupdf.open(ctrl._done_docs[plan]) as d:
+        assert d.page_count == 4
+        assert [round(p.rect.width) for p in d] == [ANSI_D[0], ANSI_D[0], LETTER[0], LETTER[0]]
+        assert seal_id.parse_keywords(d.metadata["keywords"])[1] == [0, 1, 2, 3]
+    # El original no se modificó
+    with pymupdf.open(plan) as d:
+        assert d.page_count == 3
+    # Ya sellado en esta sesión: no se puede seguir editando su estructura
+    ctrl.delete_pages(plan, [0])
+    assert len(ctrl.job.documents[plan].pages) == 4

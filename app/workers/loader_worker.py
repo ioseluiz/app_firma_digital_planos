@@ -33,7 +33,8 @@ def read_document(path, sealed_pages_by_hash):
         if marker:
             locked |= set(marker[1])
         locked |= set(sealed_pages_by_hash(sha))
-        pages = [PageInfo(p.number, p.rect.width, p.rect.height, p.rotation, p.number in locked)
+        pages = [PageInfo(p.number, p.rect.width, p.rect.height, p.rotation, p.number in locked,
+                          src_path=path, src_index=p.number)
                  for p in doc]
     if not pages:
         raise ValueError("el PDF no tiene hojas")

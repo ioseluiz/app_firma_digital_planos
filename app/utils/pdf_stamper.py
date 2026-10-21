@@ -15,6 +15,7 @@ restringidos (ver e imprimir; sin modificar, copiar ni anotar).
 Sin dependencias de Qt: se ejecuta en procesos aparte (ProcessPoolExecutor).
 """
 import datetime
+import hashlib
 import io
 import os
 import secrets
@@ -150,28 +151,76 @@ def _validate_placements(placements, page_count, locked_pages):
             raise SealRuleError(f"La hoja {idx + 1} ya fue sellada; no admite otro sello.")
 
 
+def assemble_document(pages_spec, base_metadata_from=None):
+    """Arma un PDF nuevo con las hojas indicadas [(pdf_origen, página), ...] en ese orden.
+
+    Devuelve (documento, posiciones ya selladas): una hoja que venía sellada por
+    DigitalSealer en su PDF de origen sigue bloqueada en el documento armado.
+    """
+    if not pages_spec:
+        raise ValueError("El documento debe tener al menos una hoja.")
+    out = pymupdf.open()
+    sources, locked = {}, set()
+    try:
+        for pos, (path, index) in enumerate(pages_spec):
+            src = sources.get(path)
+            if src is None:
+                if not os.path.isfile(path):
+                    raise ValueError(f"No se encuentra el PDF de origen: {path}")
+                src = sources[path] = pymupdf.open(path)
+            if not 0 <= index < src.page_count:
+                raise ValueError(f"{os.path.basename(path)} no tiene la hoja {index + 1}.")
+            marker = seal_id.parse_keywords((src.metadata or {}).get("keywords", ""))
+            if marker and index in marker[1]:
+                locked.add(pos)
+            out.insert_pdf(src, from_page=index, to_page=index)
+        base = sources.get(base_metadata_from)
+        if base is not None:
+            md = {k: v for k, v in (base.metadata or {}).items()
+                  if k in ("title", "author", "subject", "creator", "producer", "creationDate")}
+            out.set_metadata(md)
+    except Exception:
+        out.close()
+        raise
+    finally:
+        for src in sources.values():
+            src.close()
+    return out, locked
+
+
 def stamp_document(src_path, out_path, placements, stamp_png, stamp_w_mm, stamp_h_mm,
-                   hmac_key, owner_pw, owner_name="", project="", expediente="", date_iso=None):
+                   hmac_key, owner_pw, owner_name="", project="", expediente="", date_iso=None,
+                   pages_spec=None):
     """Sella `src_path` y guarda en `out_path`.
 
     placements: lista de (page_index, cx_pt, cy_pt, rotation_deg) en coordenadas
     visuales; como máximo uno por hoja (se valida).
+    pages_spec: si se indica [(pdf_origen, página), ...], primero se arma el documento
+    final con esas hojas (borradas, reordenadas o insertadas de otros PDFs) y los
+    índices de `placements` se refieren a ese documento armado.
     Devuelve dict con hashes, IDs y páginas selladas.
     """
     if os.path.abspath(src_path) == os.path.abspath(out_path):
         raise ValueError("El archivo de salida no puede ser el original.")
+    if pages_spec and any(os.path.abspath(p) == os.path.abspath(out_path) for p, _ in pages_spec):
+        raise ValueError("El archivo de salida no puede ser uno de los PDFs de origen.")
     date_iso = date_iso or datetime.date.today().isoformat()
-    src_sha = seal_id.sha256_file(src_path)
 
     stamp = Image.open(io.BytesIO(stamp_png)).convert("RGBA")
     w_pt, h_pt = geometry.mm_to_pt(stamp_w_mm), geometry.mm_to_pt(stamp_h_mm)
     strip_pt = geometry.mm_to_pt(ID_STRIP_MM)
     block_w_pt, block_h_pt = w_pt, h_pt + strip_pt
 
-    doc = pymupdf.open(src_path)
-    try:
+    if pages_spec:
+        doc, locked = assemble_document(pages_spec, base_metadata_from=src_path)
+        # El ID se liga al contenido del documento armado
+        src_sha = hashlib.sha256(doc.tobytes()).hexdigest()
+    else:
+        src_sha = seal_id.sha256_file(src_path)
+        doc = pymupdf.open(src_path)
         previous = seal_id.parse_keywords((doc.metadata or {}).get("keywords", ""))
         locked = set(previous[1]) if previous else set()
+    try:
         _validate_placements(placements, doc.page_count, locked)
 
         doc_id = seal_id.document_seal_id(hmac_key, src_sha, date_iso)
@@ -254,6 +303,7 @@ def stamp_document(src_path, out_path, placements, stamp_png, stamp_w_mm, stamp_
         "doc_id": doc_id,
         "page_ids": page_ids,
         "date": date_iso,
+        "assembled": bool(pages_spec),
     }
 
 

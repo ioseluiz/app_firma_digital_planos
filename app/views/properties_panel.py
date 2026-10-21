@@ -1,4 +1,6 @@
 """Panel derecho: hoja actual, sello de la hoja (posición/ángulo), copiar, datos del ID y salida."""
+import os
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPixmap
 from PyQt6.QtWidgets import (
@@ -237,7 +239,12 @@ class PropertiesPanel(QScrollArea):
                 w_mm, h_mm = geometry.pt_to_mm(page.width), geometry.pt_to_mm(page.height)
                 fmt = geometry.detect_format(page.width, page.height)
                 warn = "" if fmt else "  ·  formato no estándar: imprimir al 100 %"
-                self.lbl_format.setText(f"{page.format_name} · {w_mm:.0f} × {h_mm:.0f} mm{warn}")
+                src = doc.source(page)
+                origin = ""
+                if src != (doc.path, page.index):
+                    where = "" if src[0] == doc.path else f"{os.path.basename(src[0])}, "
+                    origin = f"\nOrigen: {where}hoja original {src[1] + 1}"
+                self.lbl_format.setText(f"{page.format_name} · {w_mm:.0f} × {h_mm:.0f} mm{warn}{origin}")
                 self.cmb_profile.setCurrentIndex(0 if doc.profile == PROFILE_PLAN else 1)
             else:
                 self.lbl_page.setText("Ninguna hoja seleccionada")

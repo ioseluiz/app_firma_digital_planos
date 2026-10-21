@@ -1,4 +1,6 @@
-"""Navegador Archivo ▸ Hojas con miniaturas y estado de sellado de cada hoja."""
+"""Navegador Archivo ▸ Hojas con miniaturas, estado de sellado y acciones para armar el documento."""
+import os
+
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import QAbstractItemView, QMenu, QTreeWidget, QTreeWidgetItem
@@ -7,6 +9,7 @@ from app.models.placement import PROFILE_PLAN, PROFILE_REPORT
 from app.views.icons import icon
 
 ROLE_KEY = Qt.ItemDataRole.UserRole          # (path, page_index) o (path, None)
+ROLE_SRC = Qt.ItemDataRole.UserRole + 1      # (pdf de origen, página de origen)
 
 STATUS_NONE = "none"          # sin sello
 STATUS_PLACED = "placed"      # sello colocado (posición inicial)
@@ -25,6 +28,10 @@ class PageNavigator(QTreeWidget):
     clear_all_requested = pyqtSignal(str)
     remove_file_requested = pyqtSignal(str)
     files_dropped = pyqtSignal(list)
+    # Armar el documento final
+    delete_pages_requested = pyqtSignal(str, list)          # path, [índices]
+    insert_pages_requested = pyqtSignal(str, int)           # path, posición
+    move_page_requested = pyqtSignal(str, int, int)         # path, índice, desplazamiento
 
     def __init__(self, tokens, parent=None):
         super().__init__(parent)
@@ -43,6 +50,7 @@ class PageNavigator(QTreeWidget):
         self.header().resizeSection(1, 30)
         self._files = {}     # path -> QTreeWidgetItem
         self._pages = {}     # (path, idx) -> QTreeWidgetItem
+        self._thumbs = {}    # (pdf origen, página origen) -> QIcon
         self.currentItemChanged.connect(self._on_current_changed)
 
     def set_tokens(self, tokens):
@@ -64,15 +72,39 @@ class PageNavigator(QTreeWidget):
         top.setFont(0, f)
         self.addTopLevelItem(top)
         self._files[doc.path] = top
+        self._add_pages(top, doc)
+        top.setExpanded(True)
+        self.update_file_label(doc, 0)
+
+    def _add_pages(self, top, doc):
         for page in doc.pages:
-            child = QTreeWidgetItem([self._page_text(page), ""])
+            src = doc.source(page)
+            child = QTreeWidgetItem([self._page_text(doc, page, src), ""])
             child.setData(0, ROLE_KEY, (doc.path, page.index))
-            child.setIcon(0, self._placeholder_thumb())
+            child.setData(0, ROLE_SRC, src)
+            if src != (doc.path, page.index):
+                child.setToolTip(0, f"Origen: {src[0]}\nHoja original {src[1] + 1}")
+            child.setIcon(0, self._thumbs.get(src) or self._placeholder_thumb())
             child.setSizeHint(0, QSize(0, THUMB.height() + 6))
             top.addChild(child)
             self._pages[(doc.path, page.index)] = child
-        top.setExpanded(True)
-        self.update_file_label(doc, 0)
+
+    def rebuild_document(self, doc):
+        """Vuelve a crear las hojas de un archivo tras borrar, insertar o reordenar."""
+        top = self._files.get(doc.path)
+        if top is None:
+            return
+        self.blockSignals(True)
+        try:
+            for key in [k for k in self._pages if k[0] == doc.path]:
+                del self._pages[key]
+            top.takeChildren()
+            self._add_pages(top, doc)
+        finally:
+            self.blockSignals(False)
+
+    def missing_thumbnails(self, sources):
+        return [s for s in dict.fromkeys(sources) if s not in self._thumbs]
 
     def remove_document(self, path):
         top = self._files.pop(path, None)
@@ -88,8 +120,12 @@ class PageNavigator(QTreeWidget):
         self._pages.clear()
 
     @staticmethod
-    def _page_text(page):
-        return f"Hoja {page.index + 1}\n{page.format_name}"
+    def _page_text(doc, page, src):
+        text = f"Hoja {page.index + 1} · {page.format_name}"
+        if src != (doc.path, page.index):
+            origin = "original" if src[0] == doc.path else os.path.splitext(os.path.basename(src[0]))[0]
+            text += f"\n↳ {origin} · h.{src[1] + 1}"
+        return text
 
     def _placeholder_thumb(self):
         pm = QPixmap(THUMB)
@@ -101,10 +137,8 @@ class PageNavigator(QTreeWidget):
         p.end()
         return QIcon(pm)
 
-    def set_thumbnail(self, path, index, qimage):
-        item = self._pages.get((path, index))
-        if item is None:
-            return
+    def set_thumbnail(self, src_path, src_index, qimage):
+        """Miniatura de una hoja de origen; se aplica a todas las hojas que la usan."""
         pm = QPixmap(THUMB)
         pm.fill(Qt.GlobalColor.transparent)
         img = QPixmap.fromImage(qimage).scaled(THUMB.width() - 4, THUMB.height() - 4,
@@ -116,10 +150,11 @@ class PageNavigator(QTreeWidget):
         p.setPen(QColor(self._tokens["border_strong"]))
         p.drawRect(x, y, img.width() - 1, img.height() - 1)
         p.end()
-        item.setIcon(0, QIcon(pm))
-
-    def thumbnails_needed(self):
-        return list(self._pages.keys())
+        ic = QIcon(pm)
+        self._thumbs[(src_path, src_index)] = ic
+        for item in self._pages.values():
+            if tuple(item.data(0, ROLE_SRC)) == (src_path, src_index):
+                item.setIcon(0, ic)
 
     # ------------------------------------------------------------ status
     def set_page_status(self, path, index, status, tooltip=""):
@@ -157,7 +192,10 @@ class PageNavigator(QTreeWidget):
             return
         kind = "Reporte" if doc.profile == PROFILE_REPORT else "Plano"
         n = len(doc.pages)
-        top.setText(0, f"{doc.name}\n{kind} · {sealed_count}/{n} hoja{'s' if n != 1 else ''} con sello")
+        edited = " · editado" if doc.is_modified() else ""
+        top.setText(0, f"{doc.name}\n{kind} · {sealed_count}/{n} con sello{edited}")
+        top.setToolTip(0, doc.path + ("\nEl documento final tendrá hojas borradas, reordenadas o insertadas."
+                                      if edited else ""))
 
     # ------------------------------------------------------------ selection
     def select_page(self, path, index):
@@ -184,12 +222,8 @@ class PageNavigator(QTreeWidget):
         if current is None:
             return
         path, idx = current.data(0, ROLE_KEY)
-        if idx is None:
-            if current.childCount():
-                # Al elegir un archivo, mostrar su primera hoja
-                return
-            return
-        self.page_selected.emit(path, idx)
+        if idx is not None:
+            self.page_selected.emit(path, idx)
 
     def page_order(self):
         """Todas las hojas en el orden mostrado."""
@@ -205,8 +239,31 @@ class PageNavigator(QTreeWidget):
         item = self.itemAt(event.pos())
         if item is None:
             return
-        path, _idx = item.data(0, ROLE_KEY)
+        path, idx = item.data(0, ROLE_KEY)
         menu = QMenu(self)
+        n_pages = len([k for k in self._pages if k[0] == path])
+        if idx is not None:
+            # Hojas del mismo archivo seleccionadas (para borrar varias a la vez)
+            sel = sorted(i for p, i in self.selected_pages() if p == path)
+            if idx not in sel:
+                sel = [idx]
+            label = (f"Eliminar {len(sel)} hojas del documento" if len(sel) > 1
+                     else "Eliminar esta hoja del documento")
+            act = menu.addAction(label, lambda: self.delete_pages_requested.emit(path, sel))
+            act.setEnabled(len(sel) < n_pages)
+            menu.addAction("Insertar hojas de otro PDF antes…",
+                           lambda: self.insert_pages_requested.emit(path, idx))
+            menu.addAction("Insertar hojas de otro PDF después…",
+                           lambda: self.insert_pages_requested.emit(path, idx + 1))
+            up = menu.addAction("Mover hoja arriba  (Alt+↑)", lambda: self.move_page_requested.emit(path, idx, -1))
+            down = menu.addAction("Mover hoja abajo  (Alt+↓)", lambda: self.move_page_requested.emit(path, idx, 1))
+            up.setEnabled(idx > 0)
+            down.setEnabled(idx < n_pages - 1)
+            menu.addSeparator()
+        else:
+            menu.addAction("Añadir hojas de otro PDF al final…",
+                           lambda: self.insert_pages_requested.emit(path, n_pages))
+            menu.addSeparator()
         prof = menu.addMenu("Tipo de documento")
         prof.addAction("Plano  (sello en todas las hojas)",
                        lambda: self.profile_change_requested.emit(path, PROFILE_PLAN))
@@ -217,6 +274,14 @@ class PageNavigator(QTreeWidget):
         menu.addSeparator()
         menu.addAction("Quitar archivo de la lista", lambda: self.remove_file_requested.emit(path))
         menu.exec(event.globalPos())
+
+    def keyPressEvent(self, event):
+        key = self.current_key()
+        if key and key[1] is not None and event.modifiers() & Qt.KeyboardModifier.AltModifier \
+                and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            self.move_page_requested.emit(key[0], key[1], -1 if event.key() == Qt.Key.Key_Up else 1)
+            return
+        super().keyPressEvent(event)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():

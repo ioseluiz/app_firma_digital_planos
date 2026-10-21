@@ -1,12 +1,13 @@
 import json
 import os
+from dataclasses import replace
 
 import pymupdf
 from PyQt6.QtCore import QEvent, QObject, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices, QPixmap, QUndoCommand, QUndoStack
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QLineEdit, QMessageBox
 
-from app.models.placement import PROFILE_PLAN, Placement, SealJob, SealRuleError
+from app.models.placement import PROFILE_PLAN, Placement, SealJob, SealRuleError, parse_page_ranges
 from app.models.vault_model import VaultModel
 from app.utils import geometry, pdf_stamper, seal_id, stamp_image
 from app.utils.crypto_vault import VaultError
@@ -16,7 +17,7 @@ from app.views.login_view import SetupDialog, UnlockDialog
 from app.views.main_view import MainView
 from app.views.stamp_dialog import StampDialog
 from app.views.verify_view import VerifyDialog
-from app.workers.loader_worker import FileLoaderWorker
+from app.workers.loader_worker import FileLoaderWorker, read_document
 from app.workers.render_worker import RenderWorker
 from app.workers.signing_worker import SigningWorker
 
@@ -54,6 +55,22 @@ class SetPlacementCommand(QUndoCommand):
         k, b, _ = self.changes[0]
         self.changes = [(k, b, other.changes[0][2])]
         return True
+
+
+class StructureCommand(QUndoCommand):
+    """Borrar, insertar o reordenar hojas de un documento (guarda el estado completo antes/después)."""
+
+    def __init__(self, ctrl, path, before, after, text, focus_before, focus_after):
+        super().__init__(text)
+        self.ctrl, self.path = ctrl, path
+        self.before, self.after = before, after
+        self.focus_before, self.focus_after = focus_before, focus_after
+
+    def redo(self):
+        self.ctrl.apply_structure(self.path, self.after, self.focus_after)
+
+    def undo(self):
+        self.ctrl.apply_structure(self.path, self.before, self.focus_before)
 
 
 class MainController(QObject):
@@ -218,6 +235,9 @@ class MainController(QObject):
         n.seal_all_requested.connect(self.seal_all_pages)
         n.clear_all_requested.connect(self.clear_file_seals)
         n.remove_file_requested.connect(self.remove_file)
+        n.delete_pages_requested.connect(self.delete_pages)
+        n.insert_pages_requested.connect(self.insert_pages)
+        n.move_page_requested.connect(self.move_page)
 
         c = v.canvas
         c.files_dropped.connect(self.load_files)
@@ -318,12 +338,9 @@ class MainController(QObject):
     def load_files(self, paths):
         if not paths or (self.loader and self.loader.isRunning()):
             return
-        index = {}
-        for sha in self.vault.known_output_hashes():
-            index[sha] = self.vault.sealed_pages_by_hash(sha)
         self.view.set_busy(True)
         self.view.set_status("Leyendo archivos…")
-        self.loader = FileLoaderWorker(paths, index)
+        self.loader = FileLoaderWorker(paths, self._sealed_index())
         self.loader.progress_updated.connect(self.view.progress.setValue)
         self.loader.finished_signal.connect(self._on_files_loaded)
         self.loader.start()
@@ -336,10 +353,11 @@ class MainController(QObject):
                 added.append(doc)
                 self.view.navigator.add_document(doc)
         if self._restore_data:
+            self._restore_structure(self._restore_data)
             self.job.restore_placements(self._restore_data)
             self._restore_data = None
         self.refresh_all()
-        self.render.request_thumbs([(d.path, p.index) for d in added for p in d.pages])
+        self._request_thumbs()
         locked = sum(p.locked for d in added for p in d.pages)
         msg = f"{len(added)} archivo{'s' if len(added) != 1 else ''} cargado{'s' if len(added) != 1 else ''}"
         if locked:
@@ -424,12 +442,143 @@ class MainController(QObject):
     def _request_render(self, scale):
         if self.current is None:
             return
+        path, idx = self.current
+        doc = self.job.documents[path]
+        src_path, src_index = doc.source(doc.pages[idx])   # la hoja puede venir de otro PDF
         self._render_token += 1
-        self.render.request_page(self._render_token, self.current[0], self.current[1], scale)
+        self.render.request_page(self._render_token, src_path, src_index, scale)
 
-    def _on_page_rendered(self, token, path, index, scale, image):
-        if token == self._render_token and self.current == (path, index):
+    def _on_page_rendered(self, token, _src_path, _src_index, scale, image):
+        if token == self._render_token and self.current is not None:
             self.view.canvas.set_page_image(image, scale)
+
+    def _request_thumbs(self):
+        sources = [d.source(p) for d in self.job.documents.values() for p in d.pages]
+        missing = self.view.navigator.missing_thumbnails(sources)
+        if missing:
+            self.render.request_thumbs(missing)
+
+    def _sealed_index(self):
+        """sha256 → [hojas selladas] del registro, para detectar PDFs ya sellados."""
+        return {sha: self.vault.sealed_pages_by_hash(sha) for sha in self.vault.known_output_hashes()}
+
+    # ======================================================================
+    # Armar el documento final: borrar, insertar y reordenar hojas
+    # ======================================================================
+    def _structure_editable(self, path):
+        if path not in self.job.documents:
+            return False
+        if path in self._done_docs:
+            self.view.set_status("Este archivo ya se selló en esta sesión; no se puede modificar.")
+            return False
+        return True
+
+    def _push_structure(self, path, change, text, focus):
+        """Ejecuta `change()` sobre el modelo y lo registra como comando de deshacer."""
+        before = self.job.snapshot(path)
+        before_focus = self.current[1] if self.current and self.current[0] == path else 0
+        try:
+            change()
+        except SealRuleError as e:
+            self.job.restore(path, before)
+            QMessageBox.warning(self.view, "No permitido", str(e))
+            return
+        after = self.job.snapshot(path)
+        self.job.restore(path, before)
+        self.undo.push(StructureCommand(self, path, before, after, text, before_focus, focus))
+
+    def apply_structure(self, path, snap, focus):
+        """Aplica un estado de hojas (de un comando) y refresca la vista."""
+        if path not in self.job.documents:
+            return
+        self.job.restore(path, snap)
+        doc = self.job.documents[path]
+        for key in [k for k in self._errors if k[0] == path]:
+            del self._errors[key]
+        self.view.navigator.rebuild_document(doc)
+        for p in doc.pages:
+            self._refresh_page((path, p.index))
+        self._update_file_labels({path})
+        self._update_seal_button()
+        self._request_thumbs()
+        focus = max(0, min(focus, len(doc.pages) - 1))
+        self.current = None
+        self.view.navigator.select_page(path, focus)
+        self._schedule_save()
+
+    def delete_pages(self, path, indices):
+        if not self._structure_editable(path) or not indices:
+            return
+        n = len(indices)
+        self._push_structure(path, lambda: self.job.delete_pages(path, indices),
+                             f"Eliminar {n} hoja{'s' if n != 1 else ''}", min(indices))
+        self.view.set_status(f"{n} hoja{'s' if n != 1 else ''} eliminada{'s' if n != 1 else ''} "
+                             "del documento final (Ctrl+Z para deshacer). El PDF original no se modifica.")
+
+    def move_page(self, path, index, delta):
+        if not self._structure_editable(path):
+            return
+        doc = self.job.documents[path]
+        if not 0 <= index + delta < len(doc.pages):
+            return
+        self._push_structure(path, lambda: self.job.move_page(path, index, delta), "Mover hoja", index + delta)
+
+    def insert_pages(self, path, at):
+        if not self._structure_editable(path):
+            return
+        src, _ = QFileDialog.getOpenFileName(self.view, "Insertar hojas de otro PDF", os.path.dirname(path),
+                                             "PDF (*.pdf)")
+        if not src:
+            return
+        src = os.path.normpath(src)
+        try:
+            source_doc = read_document(src, lambda sha: self._sealed_index().get(sha, []))
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self.view, "No se pudo leer", f"{os.path.basename(src)}: {e}")
+            return
+        total = len(source_doc.pages)
+        indices = list(range(total))
+        if total > 1:
+            text, ok = QInputDialog.getText(
+                self.view, "Hojas a insertar",
+                f"{os.path.basename(src)} tiene {total} hojas.\n"
+                "¿Cuáles insertar? (ej.: 1-3, 5 · vacío = todas)", QLineEdit.EchoMode.Normal, "")
+            if not ok:
+                return
+            try:
+                indices = parse_page_ranges(text, total)
+            except ValueError as e:
+                QMessageBox.warning(self.view, "Rango no válido", str(e))
+                return
+        new_pages = [replace(source_doc.pages[i], index=0, src_path=src, src_index=i) for i in indices]
+        n = len(new_pages)
+        self._push_structure(path, lambda: self.job.insert_pages(path, at, new_pages),
+                             f"Insertar {n} hoja{'s' if n != 1 else ''}", at)
+        locked = sum(p.locked for p in new_pages)
+        msg = f"{n} hoja{'s' if n != 1 else ''} insertada{'s' if n != 1 else ''} de {os.path.basename(src)}"
+        if locked:
+            msg += f" · {locked} ya venía{'n' if locked != 1 else ''} sellada{'s' if locked != 1 else ''} (bloqueada{'s' if locked != 1 else ''})"
+        self.view.set_status(msg)
+
+    def _restore_structure(self, data):
+        """Al restaurar la sesión, rehace las hojas borradas/insertadas/reordenadas."""
+        cache = {}
+        for d in data.get("documents", []):
+            spec, path = d.get("pages"), d.get("path")
+            if not spec or path not in self.job.documents:
+                continue
+            try:
+                pages = []
+                for i, (sp, si) in enumerate(spec):
+                    if sp not in cache:
+                        cache[sp] = (self.job.documents[sp] if sp in self.job.documents and sp == path
+                                     else read_document(sp, lambda sha: self._sealed_index().get(sha, [])))
+                    info = next(p for p in cache[sp].pages if cache[sp].source(p) == (sp, si))
+                    pages.append(replace(info, index=i, src_path=sp, src_index=si))
+            except Exception:  # noqa: BLE001 - si falta un origen, se deja el documento original
+                continue
+            self.job.restore(path, {"pages": pages, "placements": {}, "profile": d.get("profile", PROFILE_PLAN)})
+            self.view.navigator.rebuild_document(self.job.documents[path])
 
     # ======================================================================
     # Edición (todo pasa por comandos de deshacer)
@@ -705,7 +854,8 @@ class MainController(QObject):
                 src_path=d.path, out_path=out,
                 placements=[(i, pl.cx, pl.cy, pl.rotation) for i, pl in sorted(placements.items())],
                 stamp_png=png, stamp_w_mm=w_mm, stamp_h_mm=h_mm, hmac_key=hmac_key, owner_pw=pw,
-                owner_name=owner, project=project, expediente=expediente)})
+                owner_name=owner, project=project, expediente=expediente,
+                pages_spec=d.page_sources() if d.is_modified() else None)})
 
         dest = out_dir or "la misma carpeta de cada original"
         if QMessageBox.question(

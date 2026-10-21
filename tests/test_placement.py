@@ -104,3 +104,81 @@ def test_serialization_roundtrip():
     job2.restore_placements(data)
     assert job2.placement("a.pdf", 1) == Placement(700, 600, 12, True)
     assert job2.placement("a.pdf", 0) == job.placement("a.pdf", 0)
+
+
+# ---------------------------------------------------------------- armar documento
+def src_doc(path, sizes):
+    return DocumentEntry(path, [PageInfo(i, w, h, src_path=path, src_index=i) for i, (w, h) in enumerate(sizes)])
+
+
+def test_delete_pages_keeps_seals_with_their_page():
+    job = make_job()
+    job.add_document(src_doc("a.pdf", [ANSI_D] * 4))
+    job.set_placement("a.pdf", 3, Placement(900, 700, 30, True))
+    job.delete_pages("a.pdf", [0, 1])
+    d = job.documents["a.pdf"]
+    assert [p.index for p in d.pages] == [0, 1]
+    assert d.page_sources() == [("a.pdf", 2), ("a.pdf", 3)]
+    assert job.placement("a.pdf", 1) == Placement(900, 700, 30, True)   # viajó con su hoja
+    assert d.is_modified()
+
+
+def test_deleting_last_pages_is_detected_as_modified():
+    job = make_job()
+    job.add_document(src_doc("a.pdf", [LETTER] * 3))
+    job.delete_pages("a.pdf", [2])
+    assert job.documents["a.pdf"].is_modified()
+
+
+def test_cannot_delete_every_page():
+    job = make_job()
+    job.add_document(src_doc("a.pdf", [ANSI_D] * 2))
+    with pytest.raises(SealRuleError):
+        job.delete_pages("a.pdf", [0, 1])
+
+
+def test_insert_pages_from_other_pdf():
+    job = make_job()
+    job.add_document(src_doc("plano.pdf", [ANSI_D] * 2))
+    new = [PageInfo(0, *ANSI_D, src_path="otro.pdf", src_index=5),
+           PageInfo(0, *ANSI_D, locked=True, src_path="sellado.pdf", src_index=0)]
+    job.insert_pages("plano.pdf", 1, new)
+    d = job.documents["plano.pdf"]
+    assert d.page_sources() == [("plano.pdf", 0), ("otro.pdf", 5), ("sellado.pdf", 0), ("plano.pdf", 1)]
+    # En un plano la hoja nueva recibe sello; la que ya venía sellada no (bloqueada)
+    assert job.placement("plano.pdf", 1) is not None
+    assert job.placement("plano.pdf", 2) is None
+    assert job.placement("plano.pdf", 3) is not None   # la hoja 2 original conservó su sello
+    with pytest.raises(SealRuleError):
+        job.place("plano.pdf", 2, 500, 500)
+
+
+def test_move_page_and_snapshot_restore():
+    job = make_job()
+    job.add_document(src_doc("a.pdf", [ANSI_D] * 3))
+    job.set_placement("a.pdf", 0, Placement(600, 500, 10, True))
+    snap = job.snapshot("a.pdf")
+    assert job.move_page("a.pdf", 0, 2) == 2
+    assert job.documents["a.pdf"].page_sources()[2] == ("a.pdf", 0)
+    assert job.placement("a.pdf", 2) == Placement(600, 500, 10, True)
+    assert job.move_page("a.pdf", 0, -1) == 0   # fuera de rango: no se mueve
+    job.restore("a.pdf", snap)
+    assert job.documents["a.pdf"].page_sources() == [("a.pdf", i) for i in range(3)]
+    assert job.placement("a.pdf", 0) == Placement(600, 500, 10, True)
+    assert not job.documents["a.pdf"].is_modified()
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("", [0, 1, 2, 3, 4]), ("todas", [0, 1, 2, 3, 4]), ("2", [1]),
+    ("1-3, 5", [0, 1, 2, 4]), ("3-1", [2, 1, 0]), (" 4 ; 1 ", [3, 0]),
+])
+def test_parse_page_ranges(text, expected):
+    from app.models.placement import parse_page_ranges
+    assert parse_page_ranges(text, 5) == expected
+
+
+@pytest.mark.parametrize("text", ["6", "0", "a-b", "1-9", ","])
+def test_parse_page_ranges_invalid(text):
+    from app.models.placement import parse_page_ranges
+    with pytest.raises(ValueError):
+        parse_page_ranges(text, 5)

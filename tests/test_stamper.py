@@ -175,3 +175,37 @@ def test_generated_owner_password_is_accepted(pdf_factory, stamp_png, tmp_path):
     pdf_stamper.stamp_document(src, out, [(0, 300, 400, 0)], stamp_png, STAMP_W_MM, STAMP_H_MM, KEY, pw)
     with pymupdf.open(out) as d:
         assert d.authenticate(pw) == 4  # 4 = autenticado como propietario
+
+
+def test_assembled_document(pdf_factory, stamp_png, tmp_path):
+    """Borrar e insertar hojas de otro PDF: la salida tiene exactamente las hojas elegidas,
+    numeradas como documento final, y una hoja que venía sellada sigue bloqueada."""
+    main = pdf_factory([ANSI_D] * 3, rotations=[0, 90, 0])
+    other = pdf_factory([LETTER] * 2)
+    sealed, _ = stamp(other, [(1, 300, 400, 0)], stamp_png, tmp_path, "otro_sellado.pdf")
+
+    # Hoja 1 del principal, hoja 1 de otro, hoja 3 del principal, hoja 2 ya sellada de otro
+    spec = [(main, 0), (other, 0), (main, 2), (sealed, 1)]
+    out = str(tmp_path / "armado.pdf")
+    result = pdf_stamper.stamp_document(
+        main, out, [(0, 1200, 800, 0), (1, 300, 400, 15), (2, 1200, 800, 0)], stamp_png,
+        STAMP_W_MM, STAMP_H_MM, KEY, "pw", project="X", pages_spec=spec)
+    assert result["assembled"] and set(result["page_ids"]) == {0, 1, 2}
+    with pymupdf.open(out) as d:
+        assert d.page_count == 4
+        assert [round(p.rect.width) for p in d] == [ANSI_D[0], LETTER[0], ANSI_D[0], LETTER[0]]
+        assert seal_id.parse_keywords(d.metadata["keywords"])[1] == [0, 1, 2, 3]
+        assert [len(p.get_images()) for p in d] == [1, 1, 1, 1]
+
+    # La hoja que venía sellada no admite otro sello en el documento armado
+    with pytest.raises(SealRuleError):
+        pdf_stamper.stamp_document(main, str(tmp_path / "x.pdf"), [(3, 300, 400, 0)], stamp_png,
+                                   STAMP_W_MM, STAMP_H_MM, KEY, "pw", pages_spec=spec)
+
+
+def test_assembled_output_cannot_overwrite_a_source(pdf_factory, stamp_png, tmp_path):
+    main = pdf_factory([LETTER])
+    other = pdf_factory([LETTER])
+    with pytest.raises(ValueError):
+        pdf_stamper.stamp_document(main, other, [(0, 300, 400, 0)], stamp_png, STAMP_W_MM, STAMP_H_MM,
+                                   KEY, "pw", pages_spec=[(main, 0), (other, 0)])
